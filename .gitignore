@@ -1,0 +1,22 @@
+# Ignore everything
+*
+
+# Allow directories
+!data/
+!models/
+!src/
+!utils/
+
+# Allow files inside these directories
+!data/**
+!models/**
+!src/**
+!utils/**
+
+# Allow core python files
+!analyze_smoothness.py
+!trainc.py
+!testc.py
+
+# Allow gitignore itself
+!.gitignore
