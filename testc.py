@@ -175,7 +175,7 @@ def predict_in_batches(models, quantizer, gx, ax, batch_size=256, temperature=1.
 
 
 def main():
-    project_dir = "/home/admin407/code/zyshe/Corrector"
+    project_dir = "/home/admin407/code/zyshe/NavCorrector"
     data_root = os.path.join(project_dir, "OXIOD")
     selfmade_root = os.path.join(project_dir, "SELFMADE")
     ronin_root = os.path.join(project_dir, "RONIN")

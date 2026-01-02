@@ -449,8 +449,6 @@ class HeadingQuantizer:
                 self.bin_to_gray = None
                 self.gray_to_bin = None
 
-
-
 # ==================== 航向角分类头 ====================
 
 class HeadingBinaryHead(torch.nn.Module):
@@ -500,63 +498,6 @@ class HeadingBinaryHead(torch.nn.Module):
         h = self.dropout(h)
         
         return self.fc_out(h)
-
-
-class DualHeadingBinaryHead(torch.nn.Module):
-    """
-    双流航向角分类头：
-    - Head A: 预测原始角度
-    - Head B: 预测偏移 pi/2 后的角度
-    用于实现相位一致性检错 (Phase Consistency Check)
-    """
-    def __init__(self, feat_dim, num_bits=8, hidden_dim=256, dropout=0.3):
-        super().__init__()
-        self.num_bits = num_bits
-
-        # === 共享特征提取层 (保持原有的 ResNet/LayerNorm 结构) ===
-        self.fc1 = torch.nn.Linear(feat_dim, hidden_dim)
-        self.ln1 = torch.nn.LayerNorm(hidden_dim)
-        self.fc2 = torch.nn.Linear(hidden_dim, hidden_dim)
-        self.ln2 = torch.nn.LayerNorm(hidden_dim)
-        self.fc3 = torch.nn.Linear(hidden_dim, hidden_dim // 2)
-        self.ln3 = torch.nn.LayerNorm(hidden_dim // 2)
-
-        self.dropout = torch.nn.Dropout(dropout)
-        self.relu = torch.nn.ReLU()
-
-        # 残差投影
-        self.proj = torch.nn.Linear(feat_dim, hidden_dim)
-
-        # === 双流输出层 ===
-        # Head A: 预测 0度 相位
-        self.head_a = torch.nn.Linear(hidden_dim // 2, num_bits)
-        # Head B: 预测 90度 (pi/2) 相位
-        self.head_b = torch.nn.Linear(hidden_dim // 2, num_bits)
-
-    def forward(self, feat):
-        # 共享层前向传播
-        h = self.fc1(feat)
-        h = self.ln1(h)
-        h = self.relu(h)
-        h = self.dropout(h)
-
-        res = self.proj(feat)
-        h = self.fc2(h) + res
-        h = self.ln2(h)
-        h = self.relu(h)
-        h = self.dropout(h)
-
-        h = self.fc3(h)
-        h = self.ln3(h)
-        h = self.relu(h)
-        h = self.dropout(h)
-
-        # 分叉输出
-        logits_a = self.head_a(h)
-        logits_b = self.head_b(h)
-
-        return logits_a, logits_b
-
 
 # ==================== 损失函数 ====================
 

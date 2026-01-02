@@ -351,7 +351,7 @@ def train_heading_classifier(extractor, head, train_loader, val_loader,
 
 
 def main():
-    project_dir = "/home/admin407/code/zyshe/Corrector"
+    project_dir = "/home/admin407/code/zyshe/NavCorrector"
     data_root = os.path.join(project_dir, "OXIOD")
     selfmade_root = os.path.join(project_dir, "SELFMADE")
     ronin_root = os.path.join(project_dir, "RONIN")
