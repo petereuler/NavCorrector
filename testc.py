@@ -22,7 +22,9 @@ from utils.visualization import (
     plot_cumulative_series,
     plot_cumulative_error_series,
     plot_error_histogram,
-    analyze_encoding_errors
+    analyze_encoding_errors,
+    plot_trajectory_with_quiver,
+    plot_trajectory_turn_error_quiver
 )
 from utils.results import (
     compute_path_length,
@@ -435,6 +437,76 @@ def main():
         # 生成轨迹对比图（四个子图）
         plot_trajectory_comparison(traj_gt, traj_gt_xy, traj_pred, output_dir, base_name,
                                  traj_gt_raw=traj_gt_raw, traj_pdr=traj_pdr, vis_num=vis_len if show_full_trajectory else None)
+
+        # ==================== 新增：真值 vs 预测 双箭头矢量图 ====================
+        
+        # 1. 准备预测值的绝对航向 (N,)
+        dh_pred_steps = pred_head_soft[:len(pred_vis)-1, 0]
+        cum_headings_pred = init_h + np.cumsum(dh_pred_steps)
+        vis_headings_pred = np.concatenate([[init_h], cum_headings_pred])
+        
+        # 2. 准备真值的绝对航向 (N,)
+        # dh 是真值变化量，长度通常 >= len(pred_vis)
+        # 我们截取对应的长度
+        dh_gt_steps = dh[:len(pred_vis)-1, 0]
+        cum_headings_gt = init_h + np.cumsum(dh_gt_steps)
+        vis_headings_gt = np.concatenate([[init_h], cum_headings_gt])
+        
+        # 3. 调用绘图
+        plot_trajectory_with_quiver(
+            positions=pred_vis, 
+            headings_gt=vis_headings_gt, 
+            headings_pred=vis_headings_pred,
+            step_interval=1,    # 采样间隔，保持不变
+            arrow_length=0.2,    # 箭头长度，稍微调小了一点
+            output_file=os.path.join(output_dir, f"{base_name}_quiver.png")
+        )
+        print(f"  矢量航向对比图保存至: {base_name}_quiver.png")
+        
+        # =========================================================================
+
+        # ==================== 新增：瞬时转向误差双箭头分析图 ====================
+        
+        # A. 准备基础数据
+        # 截取长度对齐 (N-1)
+        steps_len = len(pred_vis) - 1
+        dh_pred_steps = pred_head_soft[:steps_len, 0]  # 预测的转向 (dtheta)
+        dh_gt_steps = dh[:steps_len, 0]                # 真值的转向 (dtheta)
+        
+        # B. 计算预测绝对航向 (Red Arrow Data)
+        cum_headings_pred = init_h + np.cumsum(dh_pred_steps)
+        vis_headings_pred = np.concatenate([[init_h], cum_headings_pred])
+        
+        # C. 计算"局部真值"航向 (Purple Arrow Data)
+        # 逻辑：Local_Truth = Pred_Heading + (GT_Turn - Pred_Turn)
+        # 这消除了历史累积误差，只展示"这一步"的转向误差
+        
+        # 计算瞬时转向误差
+        turn_error = dh_gt_steps - dh_pred_steps
+        
+        # 构造局部真值数组
+        # 第0步完全重合
+        # 从第1步开始，局部真值 = 预测值 + 误差
+        vis_headings_local_truth = vis_headings_pred.copy()
+        vis_headings_local_truth[1:] = vis_headings_pred[1:] + turn_error
+        
+        # D. 调用绘图
+        plot_trajectory_turn_error_quiver(
+            positions=pred_vis,
+            headings_pred=vis_headings_pred,        # 红色：模型想往哪走
+            headings_local_truth=vis_headings_local_truth, # 紫色：模型该往哪走
+            step_interval=1,    
+            arrow_length=0.2,    # 稍微大一点以便观察分叉
+            output_file=os.path.join(output_dir, f"{base_name}_turn_error_quiver.png")
+        )
+        print(f"  瞬时转向误差分析图保存至: {base_name}_turn_error_quiver.png")
+        
+        # 打印最大突变点，方便在Log中快速定位
+        max_err_idx = np.argmax(np.abs(turn_error))
+        max_err_deg = np.degrees(np.abs(turn_error[max_err_idx]))
+        print(f"  > 最大单步转向突变: {max_err_deg:.2f}° (at step {max_err_idx})")
+        
+        # ====================================================================
 
         plot_heading_analysis(dh, pred_head_soft, pred_head_hard, vis_len,
                              os.path.join(output_dir, f"{base_name}_heading_analysis.png"),

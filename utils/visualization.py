@@ -7,6 +7,9 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
+from matplotlib.collections import LineCollection
+from matplotlib.colors import Normalize
+import matplotlib.cm as cm
 
 
 def wrap_angle(angle):
@@ -938,3 +941,178 @@ def analyze_encoding_errors(gt_heading, pred_binary_probs, pred_binary_hard, qua
     return df_stats, df_error_dist
 
 
+def plot_trajectory_with_quiver(positions, headings_gt, headings_pred, step_interval=20, arrow_length=0.4, output_file=None):
+    """
+    绘制带有【真值 vs 预测】双箭头的轨迹图 (Quiver Plot)
+    
+    Args:
+        positions: (N, 2) 轨迹坐标 (x, y)
+        headings_gt: (N,) 真值绝对航向角 (弧度)
+        headings_pred: (N,) 预测绝对航向角 (弧度)
+        step_interval: 采样间隔
+        arrow_length: 箭头长度(米)
+        output_file: 保存路径
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+    from matplotlib.colors import Normalize
+    import numpy as np
+    import matplotlib.lines as mlines
+
+    x = positions[:, 0]
+    y = positions[:, 1]
+    
+    # 设置画布
+    fig, ax = plt.subplots(figsize=(12, 10), dpi=150)
+    ax.set_facecolor('white')
+    
+    # 1. 绘制轨迹线 (使用预测航向着色，或者简单的黑色)
+    # 为了突出箭头对比，轨迹线建议用简单的灰色或黑色，不要抢眼
+    ax.plot(x, y, 'k-', linewidth=1.5, alpha=0.3, label='Trajectory', zorder=1)
+
+    # 2. 绘制双箭头 (真值=绿, 预测=红)
+    indices = np.arange(0, len(positions), step_interval)
+    # 过滤掉越界索引
+    max_idx = min(len(headings_gt), len(headings_pred), len(positions))
+    indices = indices[indices < max_idx]
+    
+    # 箭头样式参数 (调小了比例，看起来更精致)
+    hw = arrow_length * 0.25  # head width
+    hl = arrow_length * 0.35  # head length
+    
+    for i in indices:
+        px, py = x[i], y[i]
+        
+        # --- 画真值箭头 (绿色) ---
+        h_gt = headings_gt[i]
+        dx_gt = arrow_length * np.cos(h_gt)
+        dy_gt = arrow_length * np.sin(h_gt)
+        
+        ax.arrow(px, py, dx_gt, dy_gt, 
+                 head_width=hw, head_length=hl, length_includes_head=True,
+                 fc='#2ecc71', ec='#27ae60',  # 亮绿填充，深绿边
+                 alpha=0.6, linewidth=0.8, zorder=5)
+
+        # --- 画预测箭头 (红色) ---
+        h_pred = headings_pred[i]
+        dx_pred = arrow_length * np.cos(h_pred)
+        dy_pred = arrow_length * np.sin(h_pred)
+        
+        ax.arrow(px, py, dx_pred, dy_pred, 
+                 head_width=hw, head_length=hl, length_includes_head=True,
+                 fc='#e74c3c', ec='#c0392b',  # 亮红填充，深红边
+                 alpha=0.8, linewidth=0.8, zorder=10) # 预测在最上层
+
+    # 3. 装饰图表
+    ax.set_title(f'Heading Comparison: GT (Green) vs Pred (Red)\n(Arrow every {step_interval} steps)', 
+                 fontsize=16, fontweight='bold', pad=15)
+    ax.set_xlabel('X Position (m)', fontsize=12)
+    ax.set_ylabel('Y Position (m)', fontsize=12)
+    ax.axis('equal')
+    ax.grid(True, linestyle='--', color='gray', alpha=0.3)
+    
+    # 起终点
+    ax.scatter(x[0], y[0], c='black', s=100, marker='o', label='Start', zorder=11)
+    ax.scatter(x[-1], y[-1], c='black', s=100, marker='X', label='End', zorder=11)
+    
+    # 自定义图例 (因为 arrow 没法很好地自动生成图例)
+    legend_handles = [
+        mlines.Line2D([], [], color='#2ecc71', marker='>', markersize=10, linestyle='None', label='Ground Truth Heading'),
+        mlines.Line2D([], [], color='#e74c3c', marker='>', markersize=10, linestyle='None', label='Predicted Heading'),
+        mlines.Line2D([], [], color='black', linewidth=1.5, alpha=0.3, label='Trajectory')
+    ]
+    ax.legend(handles=legend_handles, loc='upper right', frameon=True, fancybox=True, shadow=True)
+
+    if output_file:
+        plt.savefig(output_file, bbox_inches='tight', dpi=150)
+    else:
+        plt.show()
+    plt.close()
+
+
+def plot_trajectory_turn_error_quiver(positions, headings_pred, headings_local_truth, step_interval=20, arrow_length=0.4, output_file=None):
+    """
+    绘制【预测 vs 瞬时转向修正】双箭头轨迹图
+    用于发现引起轨迹偏差的突变点。
+    
+    Args:
+        positions: (N, 2) 轨迹坐标 (x, y)
+        headings_pred: (N,) 预测绝对航向角 (红色箭头)
+        headings_local_truth: (N,) 局部真值/瞬时修正航向角 (紫色箭头)
+                              计算公式: Pred_Heading + (GT_Turn - Pred_Turn)
+        step_interval: 采样间隔
+        arrow_length: 箭头长度(米)
+        output_file: 保存路径
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import matplotlib.lines as mlines
+
+    x = positions[:, 0]
+    y = positions[:, 1]
+    
+    # 设置画布
+    fig, ax = plt.subplots(figsize=(12, 10), dpi=150)
+    ax.set_facecolor('white')
+    
+    # 1. 绘制轨迹线 (淡灰色底图，不抢眼)
+    ax.plot(x, y, 'k-', linewidth=1.5, alpha=0.2, label='Trajectory', zorder=1)
+
+    # 2. 绘制双箭头
+    indices = np.arange(0, len(positions), step_interval)
+    max_idx = min(len(headings_local_truth), len(headings_pred), len(positions))
+    indices = indices[indices < max_idx]
+    
+    # 箭头样式
+    hw = arrow_length * 0.25
+    hl = arrow_length * 0.35
+    
+    for i in indices:
+        px, py = x[i], y[i]
+
+        # --- A. 画预测箭头 (红色，代表模型当前的实际选择) ---
+        h_pred = headings_pred[i]
+        dx_pred = arrow_length * np.cos(h_pred)
+        dy_pred = arrow_length * np.sin(h_pred)
+        
+        ax.arrow(px, py, dx_pred, dy_pred, 
+                 head_width=hw, head_length=hl, length_includes_head=True,
+                 fc='#e74c3c', ec='#c0392b',  # 亮红填充
+                 alpha=0.9, linewidth=0.8, zorder=5)
+
+        # --- B. 画瞬时修正箭头 (紫色，代表"如果这步转对了应该朝哪") ---
+        h_local = headings_local_truth[i]
+        dx_local = arrow_length * np.cos(h_local)
+        dy_local = arrow_length * np.sin(h_local)
+        
+        # 只有当两者有明显夹角时，紫色箭头才明显分叉，直观展示误差
+        ax.arrow(px, py, dx_local, dy_local, 
+                 head_width=hw, head_length=hl, length_includes_head=True,
+                 fc='#2ecc71', ec='#27ae60',  # 亮绿填充，深绿边
+                 alpha=0.8, linewidth=0.8, zorder=10)
+
+    # 3. 装饰
+    ax.set_title(f'Instantaneous Turn Error Analysis\nRed=Prediction, Purple=Ideal Heading (if turn was correct)', 
+                 fontsize=16, fontweight='bold', pad=15)
+    ax.set_xlabel('X Position (m)', fontsize=12)
+    ax.set_ylabel('Y Position (m)', fontsize=12)
+    ax.axis('equal')
+    ax.grid(True, linestyle='--', color='gray', alpha=0.3)
+    
+    # 起终点
+    ax.scatter(x[0], y[0], c='green', s=100, marker='o', label='Start', zorder=11, edgecolors='k')
+    ax.scatter(x[-1], y[-1], c='black', s=100, marker='X', label='End', zorder=11, edgecolors='k')
+    
+    # 自定义图例
+    legend_handles = [
+        mlines.Line2D([], [], color='#e74c3c', marker='>', markersize=10, linestyle='None', label='Predicted Heading'),
+        mlines.Line2D([], [], color='#9b59b6', marker='>', markersize=10, linestyle='None', label='Local Ideal Heading (Turn Corrected)'),
+        mlines.Line2D([], [], color='black', linewidth=1.5, alpha=0.2, label='Trajectory')
+    ]
+    ax.legend(handles=legend_handles, loc='upper right', frameon=True, shadow=True)
+
+    if output_file:
+        plt.savefig(output_file, bbox_inches='tight', dpi=150)
+    else:
+        plt.show()
+    plt.close()
