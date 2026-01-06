@@ -502,18 +502,22 @@ class HeadingBinaryHead(torch.nn.Module):
 # ==================== 损失函数 ====================
 
 
+# models/heading_classifier.py
 
 class HeadingBinaryLoss(nn.Module):
-    """航向角二进制编码损失（支持汉明码）"""
-    def __init__(self, num_bits=8, use_gray_code=True, quantizer=None, circular_weight=0.1):
+    """航向角二进制编码损失（支持汉明码 + 累积误差约束）"""
+    # 1. 修改 __init__ 方法，增加 cumulative_weight 参数
+    def __init__(self, num_bits=8, use_gray_code=True, quantizer=None, 
+                 circular_weight=0.1, cumulative_weight=1.0):
         super().__init__()
         self.num_bits = num_bits
         self.num_bins = 2 ** num_bits
-        self.circular_weight = circular_weight  # 周期性几何约束权重
+        self.circular_weight = circular_weight
+        self.cumulative_weight = cumulative_weight  # 新增：累积误差权重
 
         if quantizer is not None:
             self.quantizer = quantizer
-            self.output_bits = quantizer.code_bits  # 从量化器获取输出位数
+            self.output_bits = quantizer.code_bits
         else:
             self.quantizer = HeadingQuantizer(
                 num_bins=self.num_bins,
@@ -521,90 +525,80 @@ class HeadingBinaryLoss(nn.Module):
             )
             self.output_bits = self.quantizer.code_bits
 
-        # [优化] 预先将格雷码表转为 Tensor 并注册为 Buffer，避免每次 Forward 重复创建
         all_codes = torch.tensor(self.quantizer.all_gray_codes, dtype=torch.float32)
         self.register_buffer('all_gray_codes', all_codes)
 
-        # 同样预存角度中心，用于软解码
         bin_centers = torch.tensor(self.quantizer.bin_centers, dtype=torch.float32)
         self.register_buffer('bin_centers', bin_centers)
 
     def _differentiable_decode(self, logits):
-        """
-        内部使用的完全可微分的解码过程
-        """
+        """内部使用的完全可微分的解码过程"""
+        # (保持原有的 _differentiable_decode 代码不变)
         device = logits.device
-
-        # 1. 计算 Bit 概率
-        probs = torch.sigmoid(logits)  # (batch_size, bits)
-
-        # 2. 计算每个 Bin 的 Log 概率 (利用广播机制)
-        # log_probs_1: (batch_size, 1, bits)
+        probs = torch.sigmoid(logits)
         log_probs_1 = torch.log(probs + 1e-8).unsqueeze(1)
         log_probs_0 = torch.log(1 - probs + 1e-8).unsqueeze(1)
-
-        # 确保 all_gray_codes 在正确的设备上
-        codes = self.all_gray_codes.to(device).unsqueeze(0)  # (1, num_bins, bits)
-
-        # sum over bits -> (batch_size, num_bins)
-        bin_log_probs = torch.sum(
-            codes * log_probs_1 + (1 - codes) * log_probs_0,
-            dim=2
-        )
-
+        codes = self.all_gray_codes.to(device).unsqueeze(0)
+        bin_log_probs = torch.sum(codes * log_probs_1 + (1 - codes) * log_probs_0, dim=2)
         bin_probs = torch.softmax(bin_log_probs, dim=1)
-
-        # 3. 期望回归 (Expectation)
-        # 利用 sin/cos 均值来保证周期性下的正确梯度
         bin_centers = self.bin_centers.to(device)
         sin_sum = torch.sum(bin_probs * torch.sin(bin_centers), dim=1)
         cos_sum = torch.sum(bin_probs * torch.cos(bin_centers), dim=1)
-
         pred_angles = torch.atan2(sin_sum, cos_sum)
         return pred_angles
 
     def forward(self, logits, target_heading, return_details=False):
         """
-        Args:
-            logits: [batch_size, output_bits] 模型输出的logits
-            target_heading: [batch_size] 目标航向角（弧度）
-            return_details: 是否返回详细信息
-        Returns:
-            loss: 二进制交叉熵损失（标量）
-            如果 return_details=True，还返回 (loss, target_binary, pred_probs)
+        增加累积误差项 (Bias Loss)
         """
         target_heading = target_heading.squeeze(-1)
 
-        # 获取目标编码
+        # 1. 基础 BCE Loss
         target_binary = self.quantizer.encode_to_binary_vector(target_heading.cpu().numpy())
         target_binary = torch.tensor(target_binary, device=logits.device, dtype=torch.float32)
-
-        # 二进制交叉熵损失
         bce_loss = F.binary_cross_entropy_with_logits(logits, target_binary, reduction='mean')
 
-        # 辅助损失：周期性几何约束 (针对 Angle)
-        if self.circular_weight > 0:
-            # [修复] 使用可微分的软解码
+        # 获取软解码角度（用于几何约束和累积误差）
+        if self.circular_weight > 0 or self.cumulative_weight > 0:
             pred_angles_soft = self._differentiable_decode(logits)
+        else:
+            pred_angles_soft = None
 
-            # [简化] Cosine Loss 天然处理周期性，不需要手动处理 2*pi - diff
-            # Loss = 1 - cos(pred - target)
-            # 当 pred == target 时，cos=1, loss=0
-            # 当 pred 反向时，cos=-1, loss=2
+        # 2. 几何约束 Loss (Circular/Cosine Loss)
+        if self.circular_weight > 0:
             circular_loss = 1.0 - torch.cos(pred_angles_soft - target_heading)
             circular_loss = circular_loss.mean()
-
-            loss = bce_loss + self.circular_weight * circular_loss
         else:
             circular_loss = torch.tensor(0.0, device=logits.device)
-            loss = bce_loss
+
+        # 3. [新增] 累积误差 Loss (Cumulative/Bias Loss)
+        if self.cumulative_weight > 0:
+            # 计算预测值与真值的差值 (Diff)
+            diff = pred_angles_soft - target_heading
+            # 处理周期性，将差值限制在 [-pi, pi]
+            diff_wrapped = torch.atan2(torch.sin(diff), torch.cos(diff))
+            
+            # 核心逻辑：计算 Batch 内误差的均值，然后平方
+            # 这惩罚了 Batch 整体的偏移 (Bias)，模拟累积误差
+            bias_val = torch.mean(diff_wrapped)
+            cumulative_loss = bias_val ** 2 
+            # 也可以使用 torch.abs(bias_val)
+        else:
+            cumulative_loss = torch.tensor(0.0, device=logits.device)
+
+        # 总 Loss
+        loss = bce_loss + \
+               self.circular_weight * circular_loss + \
+               self.cumulative_weight * cumulative_loss
 
         if return_details:
-            return loss, {"bce": bce_loss.item(), "geo": circular_loss.item()}
+            return loss, {
+                "bce": bce_loss.item(), 
+                "geo": circular_loss.item(),
+                "cum": cumulative_loss.item() # 返回 cum loss 供打印
+            }
         else:
             return loss
-
-
 
 
 # ==================== 评估函数 ====================

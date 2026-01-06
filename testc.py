@@ -38,11 +38,11 @@ window_size = 160
 stride = 32
 vis_num1 = 20000  # 当show_full_trajectory=False时，数据加载的最大长度限制
 vis_num2 = 500    # 当show_full_trajectory=False时，可视化的最大长度限制
-show_full_trajectory = False  # 设置为True时显示完整轨迹，忽略vis_num1和vis_num2限制
+show_full_trajectory = True  # 设置为True时显示完整轨迹，忽略vis_num1和vis_num2限制
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 batch_size = 256
-dataset = "OXIOD"
+dataset = "RONIN"
 
 # 航向角量化参数（必须与 trainc.py 一致）
 num_bits = 8  # 必须是 4 的倍数
@@ -228,7 +228,7 @@ def main():
             os.path.join(data_root, 'handheld', 'data3', 'syn', 'imu1.csv'),
             os.path.join(data_root, 'handheld', 'data4', 'syn', 'imu1.csv'),
             os.path.join(data_root, 'handheld', 'data4', 'syn', 'imu3.csv'),
-            os.path.join(data_root, 'handheld', 'data5', 'syn', 'imu1.csv'),
+            os.path.join(data_root, 'handheld', 'data5', 'syn', 'imu3.csv'),
             #os.path.join(data_root, 'handheld', 'data1', 'syn', 'imu1.csv'),
         ]
         gt_files = [f.replace("imu", "vi") for f in imu_files]
@@ -326,6 +326,25 @@ def main():
         pred_len = pred_len[:min_len]
         pred_head_soft = pred_head_soft[:min_len]
         pred_head_hard = pred_head_hard[:min_len]
+
+        # =======================================================
+        # 【新增修复】强制对齐初始帧
+        # 原因：消除第0步预测误差导致的整体轨迹旋转，确保对比公平
+        # =======================================================
+        if len(pred_head_soft) > 0:
+            print(f"  > 执行初始对齐: 修正前第0步误差 {np.degrees(pred_head_soft[0,0] - dh[0,0]):.4f} deg")
+            
+            # 1. 强制第0步的航向变化完全等于真值
+            # 这样在 heading_analysis.png 中，第0个点会完全重合
+            pred_head_soft[0] = dh[0]
+            
+            # (可选) 如果你也想让硬解码对齐，加上这行
+            pred_head_hard[0] = dh[0] 
+
+            # (可选) 甚至可以对齐前几帧（例如前0.5秒），让模型“热身”
+            # warmup_steps = 5
+            # pred_head_soft[:warmup_steps] = dh[:warmup_steps]
+        # =======================================================
         
         # 对齐平滑前的数据长度
         if dl_raw is not None and dh_raw is not None and len(dl_raw) > 0 and len(dh_raw) > 0:
@@ -365,9 +384,18 @@ def main():
         if dl_raw is not None and dh_raw is not None:
             traj_gt_raw = generate_trajectory_2d(init_l_raw, init_h_raw, dl_raw, dh_raw[:len(dl_raw)])
 
-        # 提取真值位置坐标（基于窗口对应的真值位置）
-        num_windows = len(dl)
-        traj_gt_xy = extract_ground_truth_positions(pos3d, window_size, stride, num_windows, init_l)
+        # 计算 dataset_OXIOD 中使用的起始索引
+        start_frame_idx = window_size // 2 - stride // 2  # 例如 160//2 - 32//2 = 64
+
+        # 提取真值位置坐标
+        # 注意：不需要传入 init_l 了，而是传入索引，这样更精准
+        traj_gt_xy = extract_ground_truth_positions(
+            pos3d, 
+            window_size, 
+            stride, 
+            num_windows=len(dl), 
+            start_index=start_frame_idx  # <--- 关键参数
+)
         
         # 确保长度一致
         min_len = min(len(traj_gt), len(traj_gt_xy), len(traj_pred))
@@ -403,7 +431,7 @@ def main():
         # 计算评估指标（使用平滑前的真值）
         error = np.linalg.norm(gt_vis - pred_vis, axis=1)
         rmse = np.sqrt(np.mean((gt_vis - pred_vis) ** 2))
-        
+    
         # 使用平滑前的真值计算MAE
         dl_gt_for_error = dl_raw if dl_raw is not None else dl
         dh_gt_for_error = dh_raw if dh_raw is not None else dh

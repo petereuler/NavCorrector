@@ -42,41 +42,39 @@ def reconstruct_from_absolute_angles(init_pos, step_lengths, absolute_angles):
 
 
 
-def extract_ground_truth_positions(pos3d, window_size, stride, num_windows, init_l):
+def extract_ground_truth_positions(pos3d, window_size, stride, num_windows, start_index=None):
     """
-    从真值位置数据中提取与窗口对应的位置
-    
-    根据 window_dataset 的逻辑：
-    - 初始位置在 mid = window_size // 2 - stride // 2
-    - 窗口起始索引: idx = i * stride
-    - 步长和航向角变化量是从 a 到 b 计算的：
-      - a = idx + window_size // 2 - stride // 2
-      - b = idx + window_size // 2 + stride // 2
-    - 我们使用 b 位置作为该窗口的代表位置
-    
-    Args:
-        pos3d: 真值3D位置数据 (N, 3)
-        window_size: 窗口大小
-        stride: 步长
-        num_windows: 窗口数量
-        init_l: 初始位置 (2,)
-    
-    Returns:
-        gt_positions: 每个窗口对应的真值位置 (num_windows, 2)
+    修正版：提取与预测步长严格对齐的真值位置
     """
     pos2d = pos3d[:, :2]
-    gt_positions = [init_l]  # 第一个位置是初始位置
     
-    for i in range(num_windows - 1):  # 从第二个窗口开始
-        idx = i * stride
-        # 计算窗口对应的位置索引 b
-        b = idx + window_size // 2 + stride // 2
-        # 确保索引在有效范围内
-        b = min(max(0, b), len(pos2d) - 1)
-        gt_positions.append(pos2d[b])
+    # 如果没有指定 start_index，则根据 dataset_OXIOD 的逻辑计算默认偏移量
+    if start_index is None:
+        # 必须与 dataset_OXIOD.py 中的逻辑一致: mid = window//2 - stride//2
+        mid = window_size // 2 - stride // 2
+        start_index = mid
     
+    # 1. 放入起始点 (对应预测轨迹的 init_pos)
+    # 注意：这里我们直接从 pos2d 取真值，而不是用传入的 init_l，保证是绝对真值
+    if start_index >= len(pos2d):
+        return np.array([])
+        
+    gt_positions = [pos2d[start_index]] 
+    
+    # 2. 提取后续点
+    # 预测的第 i 步是从 start_index + i*stride 到 start_index + (i+1)*stride
+    # 所以轨迹点应该是序列: start, start+stride, start+2*stride...
+    
+    for i in range(num_windows):
+        # 下一个点的位置索引
+        frame_idx = start_index + (i + 1) * stride
+        
+        if frame_idx < len(pos2d):
+            gt_positions.append(pos2d[frame_idx])
+        else:
+            break
+            
     return np.array(gt_positions)
-
 
 def save_results_to_csv(gt_vis, pred_vis, traj_pdr, dl, dh, pred_len, pred_head,
                        vis_num, base_name, output_dir):

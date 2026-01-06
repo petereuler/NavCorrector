@@ -40,7 +40,7 @@ output_bits = num_bits
 # 优化器参数
 lr = 1e-4
 weight_decay = 1e-4
-epochs = 200
+epochs = 10
 
 # 训练模式：'adaptive' (余弦退火+早停) 或 'fixed' (固定学习率+固定轮数)
 train_mode = 'fixed'  # 'adaptive' or 'fixed'
@@ -49,7 +49,7 @@ early_stop_patience = 50  # 仅在 adaptive 模式下生效
 # 数据增强
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
-dataset = "OXIOD"
+dataset = "RONIN"
 
 # 从环境变量读取
 epochs = int(os.getenv('EPOCHS', epochs))
