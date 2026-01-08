@@ -635,5 +635,96 @@ def compute_heading_mae(pred_heading, target_heading):
     return torch.abs(diff).mean()
 
 
+class DualHeadingModel(torch.nn.Module):
+    """
+    双流航向预测模型：
+    - 共享骨干网络 (FeatureExtractor)
+    - 绝对航向头：HeadingBinaryHead (二进制编码)
+    - 相对航向头：RegressorHead (直接回归Δθ)
+    """
+    def __init__(self, in_channels, feat_dim=64, num_bits=8, hidden_dim=256, dropout=0.3):
+        super().__init__()
+
+        # 共享骨干网络
+        self.feature_extractor = FeatureExtractor(in_channels, feat_dim)
+
+        # 绝对航向头 (二进制编码)
+        self.abs_head = HeadingBinaryHead(feat_dim, num_bits=num_bits, hidden_dim=hidden_dim, dropout=dropout)
+
+        # 相对航向头 (回归Δθ)
+        self.rel_head = RegressorHead(feat_dim, output_dim=1)
+
+    def forward(self, x):
+        """
+        Args:
+            x: 输入特征 (batch_size, seq_len, in_channels)
+
+        Returns:
+            logits_abs: 绝对航向的二进制logits (batch_size, num_bits)
+            pred_rel: 相对航向的预测值 (batch_size, 1)
+        """
+        # 提取特征
+        feat = self.feature_extractor(x)  # (batch_size, feat_dim)
+
+        # 绝对航向预测
+        logits_abs = self.abs_head(feat)  # (batch_size, num_bits)
+
+        # 相对航向预测
+        pred_rel = self.rel_head(feat)  # (batch_size, 1)
+
+        return logits_abs, pred_rel
+
+
+class DualHeadingLoss(torch.nn.Module):
+    """
+    双流航向损失函数：
+    - 绝对航向：HeadingBinaryLoss
+    - 相对航向：MSELoss
+    - 总损失：loss_abs + w_rel * loss_rel
+    """
+    def __init__(self, num_bits=8, use_gray_code=True, quantizer=None, circular_weight=0.0, rel_weight=10.0):
+        super().__init__()
+        self.rel_weight = rel_weight
+
+        # 绝对航向损失
+        self.abs_loss = HeadingBinaryLoss(
+            num_bits=num_bits,
+            use_gray_code=use_gray_code,
+            quantizer=quantizer,
+            circular_weight=circular_weight
+        )
+
+        # 相对航向损失 (MSE)
+        self.rel_loss = torch.nn.MSELoss()
+
+    def forward(self, logits_abs, pred_rel, target_abs, target_rel):
+        """
+        Args:
+            logits_abs: 绝对航向logits (batch_size, num_bits)
+            pred_rel: 相对航向预测 (batch_size, 1)
+            target_abs: 绝对航向标签 (batch_size, 1)
+            target_rel: 相对航向标签 (batch_size, 1)
+
+        Returns:
+            total_loss: 总损失
+            loss_dict: 详细损失字典
+        """
+        # 绝对航向损失
+        loss_abs = self.abs_loss(logits_abs, target_abs)
+
+        # 相对航向损失
+        loss_rel = self.rel_loss(pred_rel, target_rel)
+
+        # 总损失
+        total_loss = loss_abs + self.rel_weight * loss_rel
+
+        loss_dict = {
+            'total': total_loss.item(),
+            'abs': loss_abs.item(),
+            'rel': loss_rel.item(),
+            'rel_weighted': (self.rel_weight * loss_rel).item()
+        }
+
+        return total_loss, loss_dict
 
 

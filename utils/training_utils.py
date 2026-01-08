@@ -23,16 +23,16 @@ def len_loss(pred, target):
 # ======= 数据加载函数 =======
 def load_data_2d_oxiod(data_root, device, window_size=160, stride=32):
     """
-    加载 OXIOD 数据集并分割为训练集和验证集
-    
+    加载 OXIOD 数据集并分割为训练集和验证集 (双流航向标签)
+
     Args:
         data_root: OXIOD 数据集根目录
         device: torch 设备
         window_size: 窗口大小
         stride: 步长
-    
+
     Returns:
-        x_tr, ylen_tr, yhead_tr, x_va, ylen_va, yhead_va
+        x_tr, ylen_tr, yhead_abs_tr, yhead_rel_tr, x_va, ylen_va, yhead_abs_va, yhead_rel_va
     """
     imu_files = [
         os.path.join(data_root, 'handheld', 'data1', 'syn', 'imu1.csv'),
@@ -62,19 +62,19 @@ def load_data_2d_oxiod(data_root, device, window_size=160, stride=32):
         os.path.join(data_root, 'handheld', 'data3', 'syn', 'imu4.csv'),
     ])
 
-    xg_tr, xa_tr, yl_tr, yh_tr = [], [], [], []
-    xg_va, xa_va, yl_va, yh_va = [], [], [], []
-    
+    xg_tr, xa_tr, yl_tr, yh_abs_tr, yh_rel_tr = [], [], [], [], []
+    xg_va, xa_va, yl_va, yh_abs_va, yh_rel_va = [], [], [], [], []
+
     for imu, gt in zip(imu_files, gt_files):
         gyro, acc, pos3d, ori = load_oxiod_raw(imu, gt)
-        
-        [gx, ax], [dl, dh], _, _ = oxiod_window(
+
+        [gx, ax], [dl, dh_abs, dh_rel], _, _ = oxiod_window(
             gyro, acc, pos3d, ori,
             mode="2d",
             window_size=window_size,
             stride=stride,
             filter_window=20,
-            smooth_heading=False,  # 启用航向角平滑，提高真值轨迹光滑性
+            smooth_heading=True,  # 启用航向角平滑，提高真值轨迹光滑性
             heading_sigma=1.5,    # 航向角高斯平滑标准差
             smooth_length=False,   # 不平滑步长，只平滑航向
             length_sigma=1.0,    # 步长高斯平滑标准差
@@ -83,40 +83,44 @@ def load_data_2d_oxiod(data_root, device, window_size=160, stride=32):
             xg_va.append(gx)
             xa_va.append(ax)
             yl_va.append(dl)
-            yh_va.append(dh)
+            yh_abs_va.append(dh_abs)
+            yh_rel_va.append(dh_rel)
         else:
             xg_tr.append(gx)
             xa_tr.append(ax)
             yl_tr.append(dl)
-            yh_tr.append(dh)
+            yh_abs_tr.append(dh_abs)
+            yh_rel_tr.append(dh_rel)
 
     x_tr = np.concatenate(xg_tr, axis=0)
     x_tr = np.concatenate([x_tr, np.concatenate(xa_tr, axis=0)], axis=-1)
     x_tr = torch.tensor(x_tr, dtype=torch.float32, device=device)
     ylen_tr = torch.tensor(np.concatenate(yl_tr, axis=0), dtype=torch.float32, device=device)
-    yhead_tr = torch.tensor(np.concatenate(yh_tr, axis=0), dtype=torch.float32, device=device)
+    yhead_abs_tr = torch.tensor(np.concatenate(yh_abs_tr, axis=0), dtype=torch.float32, device=device)
+    yhead_rel_tr = torch.tensor(np.concatenate(yh_rel_tr, axis=0), dtype=torch.float32, device=device)
 
     x_va = np.concatenate(xg_va, axis=0)
     x_va = np.concatenate([x_va, np.concatenate(xa_va, axis=0)], axis=-1)
     x_va = torch.tensor(x_va, dtype=torch.float32, device=device)
     ylen_va = torch.tensor(np.concatenate(yl_va, axis=0), dtype=torch.float32, device=device)
-    yhead_va = torch.tensor(np.concatenate(yh_va, axis=0), dtype=torch.float32, device=device)
+    yhead_abs_va = torch.tensor(np.concatenate(yh_abs_va, axis=0), dtype=torch.float32, device=device)
+    yhead_rel_va = torch.tensor(np.concatenate(yh_rel_va, axis=0), dtype=torch.float32, device=device)
 
-    return x_tr, ylen_tr, yhead_tr, x_va, ylen_va, yhead_va
+    return x_tr, ylen_tr, yhead_abs_tr, yhead_rel_tr, x_va, ylen_va, yhead_abs_va, yhead_rel_va
 
 
 def load_data_2d_selfmade(selfmade_root, device, window_size=160, stride=32):
     """
-    加载 SELFMADE 数据集并分割为训练集和验证集
-    
+    加载 SELFMADE 数据集并分割为训练集和验证集 (双流航向标签)
+
     Args:
         selfmade_root: SELFMADE 数据集根目录
         device: torch 设备
         window_size: 窗口大小
         stride: 步长
-    
+
     Returns:
-        x_tr, ylen_tr, yhead_tr, x_va, ylen_va, yhead_va
+        x_tr, ylen_tr, yhead_abs_tr, yhead_rel_tr, x_va, ylen_va, yhead_abs_va, yhead_rel_va
     """
     files = []
     for r, d, fns in os.walk(selfmade_root):
@@ -137,12 +141,12 @@ def load_data_2d_selfmade(selfmade_root, device, window_size=160, stride=32):
     n = len(files)
     split = max(1, int(0.2 * n))
     val_set = set(files[-split:])
-    xg_tr, xa_tr, yl_tr, yh_tr = [], [], [], []
-    xg_va, xa_va, yl_va, yh_va = [], [], [], []
+    xg_tr, xa_tr, yl_tr, yh_abs_tr, yh_rel_tr = [], [], [], [], []
+    xg_va, xa_va, yl_va, yh_abs_va, yh_rel_va = [], [], [], [], []
     for fp in files:
         gyro, acc, pos3d, ori = load_selfmade_raw(fp)
         
-        [gx, ax], [dl, dh], _, _ = selfmade_window(
+        [gx, ax], [dl, dh_abs, dh_rel], _, _ = selfmade_window(
             gyro, acc, pos3d, ori,
             mode="2d",
             window_size=window_size,
@@ -159,12 +163,14 @@ def load_data_2d_selfmade(selfmade_root, device, window_size=160, stride=32):
             xg_va.append(gx)
             xa_va.append(ax)
             yl_va.append(dl)
-            yh_va.append(dh)
+            yh_abs_va.append(dh_abs)
+            yh_rel_va.append(dh_rel)
         else:
             xg_tr.append(gx)
             xa_tr.append(ax)
             yl_tr.append(dl)
-            yh_tr.append(dh)
+            yh_abs_tr.append(dh_abs)
+            yh_rel_tr.append(dh_rel)
     
     if len(xg_tr) == 0:
         raise RuntimeError("Training set is empty!")
@@ -175,27 +181,29 @@ def load_data_2d_selfmade(selfmade_root, device, window_size=160, stride=32):
     x_tr = np.concatenate([x_tr, np.concatenate(xa_tr, axis=0)], axis=-1)
     x_tr = torch.tensor(x_tr, dtype=torch.float32, device=device)
     ylen_tr = torch.tensor(np.concatenate(yl_tr, axis=0), dtype=torch.float32, device=device)
-    yhead_tr = torch.tensor(np.concatenate(yh_tr, axis=0), dtype=torch.float32, device=device)
+    yhead_abs_tr = torch.tensor(np.concatenate(yh_abs_tr, axis=0), dtype=torch.float32, device=device)
+    yhead_rel_tr = torch.tensor(np.concatenate(yh_rel_tr, axis=0), dtype=torch.float32, device=device)
     x_va = np.concatenate(xg_va, axis=0)
     x_va = np.concatenate([x_va, np.concatenate(xa_va, axis=0)], axis=-1)
     x_va = torch.tensor(x_va, dtype=torch.float32, device=device)
     ylen_va = torch.tensor(np.concatenate(yl_va, axis=0), dtype=torch.float32, device=device)
-    yhead_va = torch.tensor(np.concatenate(yh_va, axis=0), dtype=torch.float32, device=device)
-    return x_tr, ylen_tr, yhead_tr, x_va, ylen_va, yhead_va
+    yhead_abs_va = torch.tensor(np.concatenate(yh_abs_va, axis=0), dtype=torch.float32, device=device)
+    yhead_rel_va = torch.tensor(np.concatenate(yh_rel_va, axis=0), dtype=torch.float32, device=device)
+    return x_tr, ylen_tr, yhead_abs_tr, yhead_rel_tr, x_va, ylen_va, yhead_abs_va, yhead_rel_va
 
 
 def load_data_2d_ronin(ronin_root, device, window_size=160, stride=32):
     """
-    加载 RONIN 数据集并分割为训练集和验证集
-    
+    加载 RONIN 数据集并分割为训练集和验证集 (双流航向标签)
+
     Args:
         ronin_root: RONIN 数据集根目录
         device: torch 设备
         window_size: 窗口大小
         stride: 步长
-    
+
     Returns:
-        x_tr, ylen_tr, yhead_tr, x_va, ylen_va, yhead_va
+        x_tr, ylen_tr, yhead_abs_tr, yhead_rel_tr, x_va, ylen_va, yhead_abs_va, yhead_rel_va
     """
     train_dirs = []
     for subset in ['train_dataset_1', 'train_dataset_2']:
@@ -213,12 +221,12 @@ def load_data_2d_ronin(ronin_root, device, window_size=160, stride=32):
             if os.path.isdir(d):
                 val_dirs.append(d)
 
-    xg_tr, xa_tr, yl_tr, yh_tr = [], [], [], []
-    xg_va, xa_va, yl_va, yh_va = [], [], [], []
+    xg_tr, xa_tr, yl_tr, yh_abs_tr, yh_rel_tr = [], [], [], [], []
+    xg_va, xa_va, yl_va, yh_abs_va, yh_rel_va = [], [], [], [], []
     for d in train_dirs:
         gyro, acc, pos3d, ori = load_ronin_raw(d)
-        
-        [gx, ax], [dl, dh], _, _ = ronin_window(
+
+        [gx, ax], [dl, dh_abs, dh_rel], _, _ = ronin_window(
             gyro, acc, pos3d, ori, mode='2d', window_size=window_size, stride=stride, filter_window=20,
             smooth_heading=True,  # 启用航向角平滑，提高真值轨迹光滑性
             heading_sigma=1.5,    # 航向角高斯平滑标准差
@@ -227,32 +235,34 @@ def load_data_2d_ronin(ronin_root, device, window_size=160, stride=32):
         )
         if gx.shape[0] == 0:
             continue
-        xg_tr.append(gx); xa_tr.append(ax); yl_tr.append(dl); yh_tr.append(dh)
+        xg_tr.append(gx); xa_tr.append(ax); yl_tr.append(dl); yh_abs_tr.append(dh_abs); yh_rel_tr.append(dh_rel)
     for d in val_dirs:
         gyro, acc, pos3d, ori = load_ronin_raw(d)
-        
-        [gx, ax], [dl, dh], _, _ = ronin_window(
+
+        [gx, ax], [dl, dh_abs, dh_rel], _, _ = ronin_window(
             gyro, acc, pos3d, ori, mode='2d', window_size=window_size, stride=stride, filter_window=20,
             smooth_heading=True,  # 启用航向角平滑，提高真值轨迹光滑性
-            heading_sigma=1.25,    # 航向角高斯平滑标准差
+            heading_sigma=1,    # 航向角高斯平滑标准差
             smooth_length=False,  # 不平滑步长，只平滑航向
             length_sigma=1.5,    # 步长高斯平滑标准差
         )
         if gx.shape[0] == 0:
             continue
-        xg_va.append(gx); xa_va.append(ax); yl_va.append(dl); yh_va.append(dh)
+        xg_va.append(gx); xa_va.append(ax); yl_va.append(dl); yh_abs_va.append(dh_abs); yh_rel_va.append(dh_rel)
 
     x_tr = np.concatenate(xg_tr, axis=0)
     x_tr = np.concatenate([x_tr, np.concatenate(xa_tr, axis=0)], axis=-1)
     x_tr = torch.tensor(x_tr, dtype=torch.float32, device=device)
     ylen_tr = torch.tensor(np.concatenate(yl_tr, axis=0), dtype=torch.float32, device=device)
-    yhead_tr = torch.tensor(np.concatenate(yh_tr, axis=0), dtype=torch.float32, device=device)
+    yhead_abs_tr = torch.tensor(np.concatenate(yh_abs_tr, axis=0), dtype=torch.float32, device=device)
+    yhead_rel_tr = torch.tensor(np.concatenate(yh_rel_tr, axis=0), dtype=torch.float32, device=device)
     x_va = np.concatenate(xg_va, axis=0)
     x_va = np.concatenate([x_va, np.concatenate(xa_va, axis=0)], axis=-1)
     x_va = torch.tensor(x_va, dtype=torch.float32, device=device)
     ylen_va = torch.tensor(np.concatenate(yl_va, axis=0), dtype=torch.float32, device=device)
-    yhead_va = torch.tensor(np.concatenate(yh_va, axis=0), dtype=torch.float32, device=device)
-    return x_tr, ylen_tr, yhead_tr, x_va, ylen_va, yhead_va
+    yhead_abs_va = torch.tensor(np.concatenate(yh_abs_va, axis=0), dtype=torch.float32, device=device)
+    yhead_rel_va = torch.tensor(np.concatenate(yh_rel_va, axis=0), dtype=torch.float32, device=device)
+    return x_tr, ylen_tr, yhead_abs_tr, yhead_rel_tr, x_va, ylen_va, yhead_abs_va, yhead_rel_va
 
 
 def plot_quantizer_analysis(quantizer, heading_data, curve_dir, num_bins):

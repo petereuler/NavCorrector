@@ -11,6 +11,7 @@ from data.dataset_RONIN import load_ronin_raw, window_dataset as ronin_window
 from models.heading_classifier import (
     FeatureExtractor, RegressorHead,
     HeadingQuantizer, HeadingBinaryHead,
+    DualHeadingModel,
 )
 from src.util import generate_trajectory_2d
 from src.pdr import PDR
@@ -38,7 +39,7 @@ window_size = 160
 stride = 32
 vis_num1 = 20000  # 当show_full_trajectory=False时，数据加载的最大长度限制
 vis_num2 = 500    # 当show_full_trajectory=False时，可视化的最大长度限制
-show_full_trajectory = True  # 设置为True时显示完整轨迹，忽略vis_num1和vis_num2限制
+show_full_trajectory = False  # 设置为True时显示完整轨迹，忽略vis_num1和vis_num2限制
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 batch_size = 256
@@ -73,17 +74,22 @@ def load_models(ckpt_dir, device):
     
     models = {
         'extractor_len': FeatureExtractor(input_dim, feature_dim).to(device),
-        'extractor_head': FeatureExtractor(input_dim, feature_dim).to(device),
         'reg_len': RegressorHead(feature_dim, 1).to(device),
     }
-    
-    # 使用改进的二进制分类头
-    models['head'] = HeadingBinaryHead(feature_dim, num_bits=output_bits, hidden_dim=256, dropout=0.3).to(device)
+
+    # 双流航向模型
+    models['dual_heading'] = DualHeadingModel(
+        in_channels=input_dim,
+        feat_dim=feature_dim,
+        num_bits=output_bits,
+        hidden_dim=256,
+        dropout=0.3
+    ).to(device)
+
     model_files = {
         'extractor_len': 'extractor_len.pth',
-        'extractor_head': 'extractor_head_cls.pth',
         'reg_len': 'reg_len.pth',
-        'head': 'cls_head.pth',
+        'dual_heading': 'dual_heading_model.pth',
     }
     
     for model_name, filename in model_files.items():
@@ -98,82 +104,112 @@ def load_models(ckpt_dir, device):
     return models, quantizer
 
 
-def predict_in_batches(models, quantizer, gx, ax, batch_size=256, temperature=1.0, return_binary=False):
-    """批量预测 (集成 Soft Decoding)
-    
+def predict_in_batches(models, quantizer, gx, ax, batch_size=256, fusion_alpha=0.1):
+    """批量预测双流航向模型并进行互补滤波融合
+
     Args:
-        return_binary: 是否返回二进制编码（用于统计）
+        models: 包含所有模型的字典
+        quantizer: 航向量化器
+        gx: 陀螺仪数据
+        ax: 加速度数据
+        batch_size: 批次大小
+        fusion_alpha: 互补滤波权重 (0-1)，控制绝对航向 vs 相对航向的比例
+
     Returns:
-        pred_len, pred_head_soft, pred_head_hard, (pred_binary_probs, pred_binary_hard, logits_h)
+        pred_len: 预测步长
+        pred_head_fused: 融合后的航向 (使用互补滤波)
+        pred_head_abs: 绝对航向预测 (用于统计)
+        pred_binary_probs, pred_binary_hard, pred_logits: 二进制编码统计
     """
     n = gx.shape[0]
     preds_len = []
-    preds_head_soft = []
-    preds_head_hard = []
+    preds_head_fused = []
+    preds_head_abs = []
     preds_binary_probs = []
     preds_binary_hard = []
     preds_logits = []
 
     models['extractor_len'].eval()
     models['reg_len'].eval()
-    models['extractor_head'].eval()
-    models['head'].eval()
-    
+    models['dual_heading'].eval()
+
+    # 初始化融合航向 (第一个时刻使用绝对航向预测)
+    fused_heading_prev = None
+
     with torch.no_grad():
         for start in range(0, n, batch_size):
             end = min(start + batch_size, n)
 
             # 准备数据
-            xb = torch.tensor(np.concatenate([gx[start:end], ax[start:end]], axis=-1), 
+            xb = torch.tensor(np.concatenate([gx[start:end], ax[start:end]], axis=-1),
                             dtype=torch.float32, device=device)
-            
+
             # === 1. 步长预测 ===
             feat_l = models['extractor_len'](xb)
             pred_l = models['reg_len'](feat_l)
-            
-            # === 2. 航向预测 ===
-            feat_h = models['extractor_head'](xb)
-            logits_h = models['head'](feat_h)
-            
-            # === 3. 关键修改：区分硬解码和软解码 ===
 
-            # A. 硬解码 (Hard Decode) - 用于统计 Bit 错误率
-            probs = torch.sigmoid(logits_h)
+            # === 2. 双流航向预测 ===
+            logits_abs, pred_rel = models['dual_heading'](xb)
+
+            # === 3. 绝对航向解码 ===
+            # A. 硬解码 (用于统计)
+            probs = torch.sigmoid(logits_abs)
             pred_binary = probs.cpu().numpy()
             pred_binary_hard_batch = (pred_binary > 0.5).astype(np.int32)
-            
-            # 使用 quantizer 的硬解码方法 (返回 Bin 中心)
-            pred_h_hard_batch = quantizer.decode_from_binary_vector(pred_binary)
 
-            # B. 软解码 (Soft Decode) - 用于生成高精度轨迹
-            # 直接调用我们在 trainc.py 中使用的 soft expectation
-            # 注意：这需要 logits，而不是 binary vector
-            pred_h_soft_batch = quantizer.decode_soft_expectation(logits_h).cpu().numpy()
+            # B. 软解码 (用于融合)
+            pred_h_abs_batch = quantizer.decode_soft_expectation(logits_abs).cpu().numpy()
 
-            # === 4. 收集结果 ===
+            # === 4. 互补滤波融合 ===
+            batch_size_current = pred_h_abs_batch.shape[0]
+
+            # 初始化融合航向数组
+            if pred_h_abs_batch.ndim == 1:
+                fused_headings = np.zeros(batch_size_current)
+            else:
+                fused_headings = np.zeros((batch_size_current, pred_h_abs_batch.shape[1]))
+
+            for i in range(batch_size_current):
+                # 当前批次中的绝对航向预测
+                abs_pred = pred_h_abs_batch[i] if pred_h_abs_batch.ndim == 1 else pred_h_abs_batch[i, 0]
+
+                # 相对航向预测 (弧度)
+                rel_pred = pred_rel[i, 0].cpu().numpy()
+
+                if fused_heading_prev is None:
+                    # 第一个时刻：直接使用绝对航向
+                    fused_heading = abs_pred
+                else:
+                    # 互补滤波: H_final[t] = (1-α) * (H_final[t-1] + ΔH_pred[t]) + α * H_abs_pred[t]
+                    rel_integration = fused_heading_prev + rel_pred
+                    fused_heading = (1 - fusion_alpha) * rel_integration + fusion_alpha * abs_pred
+
+                if fused_headings.ndim == 1:
+                    fused_headings[i] = fused_heading
+                else:
+                    fused_headings[i, 0] = fused_heading
+                fused_heading_prev = fused_heading
+
+            # === 5. 收集结果 ===
             preds_len.append(pred_l.cpu().numpy())
-            preds_head_soft.append(pred_h_soft_batch.reshape(-1, 1))
-            preds_head_hard.append(pred_h_hard_batch.reshape(-1, 1))
-            
-            if return_binary:
-                preds_binary_probs.append(pred_binary)
-                preds_binary_hard.append(pred_binary_hard_batch)
-                preds_logits.append(logits_h.cpu().numpy())
-            
-            # 清理显存 (对于大文件很重要)
-            del xb, feat_l, pred_l, feat_h, logits_h
-                
+            preds_head_fused.append(fused_headings)
+            preds_head_abs.append(pred_h_abs_batch.reshape(-1, 1))
+            preds_binary_probs.append(pred_binary)
+            preds_binary_hard.append(pred_binary_hard_batch)
+            preds_logits.append(logits_abs.cpu().numpy())
+
+            # 清理显存
+            del xb, feat_l, pred_l, logits_abs, pred_rel
+
+    # 合并所有批次的结果
     pred_len = np.concatenate(preds_len, axis=0)
-    pred_head_soft = np.concatenate(preds_head_soft, axis=0)
-    pred_head_hard = np.concatenate(preds_head_hard, axis=0)
-    
-    if return_binary:
-        pred_binary_probs = np.concatenate(preds_binary_probs, axis=0)
-        pred_binary_hard = np.concatenate(preds_binary_hard, axis=0)
-        pred_logits = np.concatenate(preds_logits, axis=0)
-        return pred_len, pred_head_soft, pred_head_hard, pred_binary_probs, pred_binary_hard, pred_logits
-    else:
-        return pred_len, pred_head_soft, pred_head_hard
+    pred_head_fused = np.concatenate(preds_head_fused, axis=0)
+    pred_head_abs = np.concatenate(preds_head_abs, axis=0)
+    pred_binary_probs = np.concatenate(preds_binary_probs, axis=0)
+    pred_binary_hard = np.concatenate(preds_binary_hard, axis=0)
+    pred_logits = np.concatenate(preds_logits, axis=0)
+
+    return pred_len, pred_head_fused, pred_head_abs, pred_binary_probs, pred_binary_hard, pred_logits
 
 
 def main():
@@ -279,7 +315,7 @@ def main():
             filter_window = 20  # OXIOD 数据集使用位置平滑
         
         # 先获取平滑前的真值（用于对比）
-        [gx_raw, ax_raw], [dl_raw, dh_raw], init_l_raw, init_h_raw = window_fn(
+        [gx_raw, ax_raw], [dl_raw, dh_abs_raw, dh_rel_raw], init_l_raw, init_h_raw = window_fn(
             gyro, acc, pos3d, ori,
             mode="2d",
             window_size=window_size,
@@ -288,20 +324,24 @@ def main():
             smooth_heading=False,  # 不平滑航向角
             smooth_length=False,    # 不平滑步长
         )
-            
+
         # 再获取平滑后的真值（用于训练和评估）
-        [gx, ax], [dl, dh], init_l, init_h = window_fn(
+        [gx, ax], [dl, dh_abs, dh_rel], init_l, init_h = window_fn(
             gyro, acc, pos3d, ori,
             mode="2d",
             window_size=window_size,
             stride=stride,
             filter_window=filter_window,
-            smooth_heading=False,  # 启用航向角平滑，与训练时保持一致
+            smooth_heading=True,  # 启用航向角平滑，用于显示平滑后的轨迹
             heading_sigma=1.5,    # 航向角高斯平滑标准差
             smooth_length=False,   # 不平滑步长，只平滑航向
             length_sigma=1.0,    # 步长高斯平滑标准差
         )
-        
+
+        # 为兼容性，将绝对航向作为主要航向
+        dh_raw = dh_abs_raw
+        dh = dh_abs
+
         if gx.shape[0] == 0:
             print("窗口长度不足，跳过该序列")
             continue
@@ -314,10 +354,15 @@ def main():
             parts = rel_path.split(os.sep)
             base_name = f"{parts[-3]}_{parts[-1].split('.')[0]}"
             
-        # 预测（同时获取二进制编码用于统计）
-        pred_len, pred_head_soft, pred_head_hard, pred_binary_probs, pred_binary_hard, pred_logits = predict_in_batches(
-            models, quantizer, gx, ax, batch_size=batch_size, temperature=1.0, return_binary=True
+        # 预测（双流航向 + 互补滤波融合）
+        fusion_alpha = 0.1  # 互补滤波权重
+        pred_len, pred_head_fused, pred_head_abs, pred_binary_probs, pred_binary_hard, pred_logits = predict_in_batches(
+            models, quantizer, gx, ax, batch_size=batch_size, fusion_alpha=fusion_alpha
         )
+
+        # 为了兼容性，将融合结果作为主要预测结果
+        pred_head_soft = pred_head_fused.reshape(-1, 1)  # 用于轨迹重建的主要航向
+        pred_head_hard = pred_head_abs.reshape(-1, 1)    # 用于统计的绝对航向
     
         # 对齐数据长度
         min_len = min(len(dl), len(dh), len(pred_len), len(pred_head_soft), len(pred_head_hard))

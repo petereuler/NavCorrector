@@ -12,7 +12,8 @@ import quaternion
 from models.heading_classifier import (
     FeatureExtractor, RegressorHead,
     HeadingQuantizer, HeadingBinaryLoss,
-    compute_bit_accuracy, compute_heading_mae, HeadingBinaryHead
+    compute_bit_accuracy, compute_heading_mae, HeadingBinaryHead,
+    DualHeadingModel, DualHeadingLoss
 )
 from utils.training_utils import (
     len_loss,
@@ -158,134 +159,124 @@ def train_length_model(extractor, regressor, train_loader, val_loader, ckpt_dir,
     plt.close()
 
 
-def train_heading_classifier(extractor, head, train_loader, val_loader,
-                             ckpt_dir, curve_dir, quantizer):
-    """训练航向分类模型 (Binary Output + Soft Decode Validation)"""
-    optimizer = optim.AdamW(
-        list(extractor.parameters()) + list(head.parameters()),
-        lr=lr, weight_decay=weight_decay
-    )
+def train_dual_heading_model(model, train_loader, val_loader,
+                              ckpt_dir, curve_dir, quantizer):
+    """训练双流航向模型 (绝对航向 + 相对航向)"""
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     if train_mode == 'fixed':
         scheduler = None
     else:
         scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2)
 
-    # 定义基础权重
-    base_circular_weight = 1  # 建议稍微提高一点权重，因为现在Loss是可导的
-
-    # 初始化 Loss (初始权重设为 0)
-    criterion = HeadingBinaryLoss(
+    # 初始化双流损失函数
+    rel_weight = 10.0  # 相对航向损失权重
+    criterion = DualHeadingLoss(
         num_bits=num_bits,
         use_gray_code=True,
         quantizer=quantizer,
-        circular_weight=0.0
+        circular_weight=0.0,  # 初始设为0，后续warmup
+        rel_weight=rel_weight
     )
-    
-    ckpts = [os.path.join(ckpt_dir, f) for f in ["extractor_head_cls.pth", "cls_head.pth"]]
+
+    ckpts = [os.path.join(ckpt_dir, f) for f in ["dual_heading_extractor.pth", "dual_heading_model.pth"]]
 
     if os.path.exists(ckpts[0]) and os.path.exists(ckpts[1]):
-        extractor.load_state_dict(torch.load(ckpts[0]))
-        head.load_state_dict(torch.load(ckpts[1]))
-        print("[Heading] 发现已有最佳模型，跳过训练")
+        # 加载完整模型
+        checkpoint = torch.load(ckpts[1])
+        model.load_state_dict(checkpoint)
+        print("[Dual Heading] 发现已有最佳模型，跳过训练")
         return
 
     best_mae = float('inf')
     train_curve = []
     val_curve = []
     val_mae_curve = []
+    abs_loss_curve = []
+    rel_loss_curve = []
     no_improve = 0
 
     mode_str = "Fixed LR" if train_mode == 'fixed' else "Adaptive (Cosine+EarlyStop)"
-    print(f">>> 开始训练航向模型 (Binary Loss, Soft Val, {mode_str})")
+    print(f">>> 开始训练双流航向模型 (Abs+Rel, {mode_str})")
 
     for ep in range(epochs):
         t0 = time.time()
 
-        # Loss Warm-up: 前5轮不加几何约束，之后线性增加或固定
+        # Loss Warm-up: 前5轮不加几何约束，之后线性增加
         if ep < 5:
             current_geo_weight = 0.0
         else:
-            current_geo_weight = base_circular_weight
-        criterion.circular_weight = current_geo_weight
+            current_geo_weight = 1.0  # 基础几何权重
+        criterion.abs_loss.circular_weight = current_geo_weight
 
-        extractor.train()
-        head.train()
+        model.train()
         total_loss = 0.0
-        total_bce = 0.0
-        total_geo = 0.0
+        total_abs_loss = 0.0
+        total_rel_loss = 0.0
         cnt = 0
 
-        for xb, _, yb_head in train_loader:
-            feat = extractor(xb)
-            logits = head(feat)
+        for xb, _, yb_head_abs, yb_head_rel in train_loader:
+            logits_abs, pred_rel = model(xb)
 
-            # 获取详细 Loss
-            loss, details = criterion(logits, yb_head, return_details=True)
+            # 计算双流损失
+            loss, loss_dict = criterion(logits_abs, pred_rel, yb_head_abs, yb_head_rel)
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(extractor.parameters(), 1.0)
-            torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
             bs = xb.size(0)
             total_loss += loss.item() * bs
-            total_bce += details['bce'] * bs
-            total_geo += details['geo'] * bs
+            total_abs_loss += loss_dict['abs'] * bs
+            total_rel_loss += loss_dict['rel'] * bs
             cnt += bs
 
         if scheduler is not None:
             scheduler.step()
 
         avg_train_loss = total_loss / max(cnt, 1)
-        avg_bce = total_bce / max(cnt, 1)
-        avg_geo = total_geo / max(cnt, 1)
+        avg_abs_loss = total_abs_loss / max(cnt, 1)
+        avg_rel_loss = total_rel_loss / max(cnt, 1)
 
         # 验证 Loop
-        extractor.eval()
-        head.eval()
+        model.eval()
         vtotal = 0.0
         vcnt = 0
-        all_logits = []
-        all_targets = []
+        all_logits_abs = []
+        all_targets_abs = []
 
         with torch.no_grad():
-            for xb, _, yb_head in val_loader:
-                feat = extractor(xb)
-                logits = head(feat)
-                loss = criterion(logits, yb_head) # 验证集Loss只作参考
+            for xb, _, yb_head_abs, yb_head_rel in val_loader:
+                logits_abs, pred_rel = model(xb)
+                loss, _ = criterion(logits_abs, pred_rel, yb_head_abs, yb_head_rel)
 
                 bs = xb.size(0)
                 vtotal += loss.item() * bs
                 vcnt += bs
 
-                all_logits.append(logits)
-                all_targets.append(yb_head)
+                all_logits_abs.append(logits_abs)
+                all_targets_abs.append(yb_head_abs)
 
         val_loss = vtotal / max(vcnt, 1)
 
-        # ==========================================
-        # 关键修改：验证集使用 Soft Decoding 计算 MAE
-        # ==========================================
-        all_logits = torch.cat(all_logits, dim=0)
-        all_targets = torch.cat(all_targets, dim=0)
+        # 计算绝对航向MAE (使用Soft Decoding)
+        all_logits_abs = torch.cat(all_logits_abs, dim=0)
+        all_targets_abs = torch.cat(all_targets_abs, dim=0)
+        pred_heading_abs = quantizer.decode_soft_expectation(all_logits_abs)
+        mae = compute_heading_mae(pred_heading_abs, all_targets_abs)
 
-        # 使用我们在上一节实现的 decode_soft_expectation
-        pred_heading_soft = quantizer.decode_soft_expectation(all_logits)
-
-        # 计算 MAE (Pred 和 Target 都是 Tensor 且在 GPU 上)
-        mae = compute_heading_mae(pred_heading_soft, all_targets)
-        
         train_curve.append(avg_train_loss)
         val_curve.append(val_loss)
         val_mae_curve.append(mae.item())
+        abs_loss_curve.append(avg_abs_loss)
+        rel_loss_curve.append(avg_rel_loss)
 
         # 保存最佳模型
         if mae.item() < best_mae:
             best_mae = mae.item()
-            torch.save(extractor.state_dict(), ckpts[0])
-            torch.save(head.state_dict(), ckpts[1])
+            torch.save(model.feature_extractor.state_dict(), ckpts[0])
+            torch.save(model.state_dict(), ckpts[1])
             no_improve = 0
         else:
             no_improve += 1
@@ -296,57 +287,52 @@ def train_heading_classifier(extractor, head, train_loader, val_loader,
 
         if (ep + 1) % 5 == 0 or ep == 0:
             current_lr = scheduler.get_last_lr()[0] if scheduler else lr
-            # 打印包含双流 Loss 的信息
-            print(f"[Heading Ep {ep+1}] "
-                  f"Loss: {avg_train_loss:.4f} (BCE_A:{avg_bce:.3f}, BCE_B:{avg_bce:.3f}, Geo:{avg_geo:.3f}, W:{current_geo_weight}) "
+            print(f"[Dual Heading Ep {ep+1}] "
+                  f"Loss: {avg_train_loss:.4f} (Abs:{avg_abs_loss:.4f}, Rel:{avg_rel_loss:.4f}) "
                   f"| Val MAE: {np.degrees(mae.item()):.2f}° "
                   f"| Time: {time.time()-t0:.1f}s")
 
     # 绘制曲线
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    
+
     axes[0, 0].plot(train_curve, label='train')
     axes[0, 0].plot(val_curve, label='val')
-    axes[0, 0].set_title('Binary Loss')
+    axes[0, 0].set_title('Total Loss')
     axes[0, 0].set_xlabel('Epoch')
     axes[0, 0].legend()
-    
-    # Validation Accuracy plot removed (not applicable for binary) or replaced
-    axes[0, 1].text(0.5, 0.5, "Binary Output Mode\nAccuracy Metric N/A", ha='center')
-    axes[0, 1].axis('off')
-    
+
+    axes[0, 1].plot(abs_loss_curve, label='abs loss', color='blue')
+    axes[0, 1].plot(rel_loss_curve, label='rel loss', color='red')
+    axes[0, 1].set_title('Component Losses')
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].legend()
+
     axes[1, 0].plot([np.degrees(m) for m in val_mae_curve])
-    axes[1, 0].set_title('Validation MAE (Soft Decoding)')
+    axes[1, 0].set_title('Validation MAE (Abs Heading)')
     axes[1, 0].set_xlabel('Epoch')
     axes[1, 0].set_ylabel('MAE (deg)')
-    
+
     # 最佳 MAE 标记
     best_idx = np.argmin(val_mae_curve)
-    axes[1, 0].scatter([best_idx], [np.degrees(val_mae_curve[best_idx])], 
-                       color='green', s=100, zorder=5, label=f'Best: {np.degrees(val_mae_curve[best_idx]):.2f}deg')
+    axes[1, 0].scatter([best_idx], [np.degrees(val_mae_curve[best_idx])],
+                       color='green', s=100, zorder=5,
+                       label=f'Best: {np.degrees(val_mae_curve[best_idx]):.2f}deg')
     axes[1, 0].legend()
-    
-    # 绘制 bin 宽度分布（仅自适应量化）
-    if use_adaptive_quantization and quantizer.fitted:
-        bin_widths = np.diff(quantizer.bin_edges)
-        axes[1, 1].bar(range(len(bin_widths)), np.degrees(bin_widths), alpha=0.7)
-        axes[1, 1].axhline(y=np.degrees(2*np.pi/num_bins), color='r', linestyle='--', 
-                          label=f'Uniform: {np.degrees(2*np.pi/num_bins):.2f}deg')
-        axes[1, 1].set_title('Bin Width Distribution (Adaptive)')
-        axes[1, 1].set_xlabel('Bin Index')
-        axes[1, 1].set_ylabel('Width (deg)')
-        axes[1, 1].legend()
-    else:
-        axes[1, 1].text(0.5, 0.5, f"Best MAE: {np.degrees(best_mae):.2f}deg\n"
-                        f"Num Bits: {num_bits}\n",
-                        ha='center', va='center', fontsize=14,
-                        transform=axes[1, 1].transAxes)
-        axes[1, 1].axis('off')
-    
+
+    # 训练信息
+    axes[1, 1].text(0.5, 0.5,
+                    f"Dual Heading Model\n"
+                    f"Best MAE: {np.degrees(best_mae):.2f}deg\n"
+                    f"Num Bits: {num_bits}\n"
+                    f"Rel Weight: {rel_weight}",
+                    ha='center', va='center', fontsize=12,
+                    transform=axes[1, 1].transAxes)
+    axes[1, 1].axis('off')
+
     plt.tight_layout()
-    plt.savefig(os.path.join(curve_dir, 'curve_heading.png'))
+    plt.savefig(os.path.join(curve_dir, 'curve_dual_heading.png'))
     plt.close()
-    
+
     print(f"\n最佳验证 MAE: {np.degrees(best_mae):.2f}°")
 
 
@@ -376,17 +362,17 @@ def main():
     # 加载数据
     print("\n📊 加载训练数据...")
     if dataset == "SELFMADE" and os.path.isdir(selfmade_root):
-        x_tr, ylen_tr, yhead_tr, x_va, ylen_va, yhead_va = load_data_2d_selfmade(selfmade_root, device, window_size, stride)
+        x_tr, ylen_tr, yhead_abs_tr, yhead_rel_tr, x_va, ylen_va, yhead_abs_va, yhead_rel_va = load_data_2d_selfmade(selfmade_root, device, window_size, stride)
     elif dataset == "RONIN" and os.path.isdir(ronin_root):
-        x_tr, ylen_tr, yhead_tr, x_va, ylen_va, yhead_va = load_data_2d_ronin(ronin_root, device, window_size, stride)
+        x_tr, ylen_tr, yhead_abs_tr, yhead_rel_tr, x_va, ylen_va, yhead_abs_va, yhead_rel_va = load_data_2d_ronin(ronin_root, device, window_size, stride)
     else:
-        x_tr, ylen_tr, yhead_tr, x_va, ylen_va, yhead_va = load_data_2d_oxiod(data_root, device, window_size, stride)
+        x_tr, ylen_tr, yhead_abs_tr, yhead_rel_tr, x_va, ylen_va, yhead_abs_va, yhead_rel_va = load_data_2d_oxiod(data_root, device, window_size, stride)
         
     print(f"训练集: {x_tr.shape[0]} 样本")
     print(f"验证集: {x_va.shape[0]} 样本")
     
     # 打印航向角分布
-    head_tr_np = yhead_tr.cpu().numpy().flatten()
+    head_tr_np = yhead_abs_tr.cpu().numpy().flatten()
     print(f"航向角范围: [{np.degrees(head_tr_np.min()):.1f}°, {np.degrees(head_tr_np.max()):.1f}°]")
     print(f"航向角标准差: {np.degrees(head_tr_np.std()):.1f}°")
     print(f"航向角中位数: {np.degrees(np.median(head_tr_np)):.1f}°")
@@ -414,8 +400,8 @@ def main():
     # [修改] 对于均匀量化，仍然绘制分析图以便观察分布
     plot_quantizer_analysis(quantizer, head_tr_np, curve_dir, num_bins)
     
-    train_dataset = TensorDataset(x_tr, ylen_tr, yhead_tr)
-    val_dataset = TensorDataset(x_va, ylen_va, yhead_va)
+    train_dataset = TensorDataset(x_tr, ylen_tr, yhead_abs_tr, yhead_rel_tr)
+    val_dataset = TensorDataset(x_va, ylen_va, yhead_abs_va, yhead_rel_va)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
 
@@ -426,17 +412,21 @@ def main():
     extractor_len = FeatureExtractor(in_channels=in_ch, feat_dim=feat_dim).to(device)
     reg_len = RegressorHead(feat_dim, output_dim_len).to(device)
     
-    # 航向模型（使用改进的二进制分类头）
-    extractor_head = FeatureExtractor(in_channels=in_ch, feat_dim=feat_dim).to(device)
-    # 注意：这里输出维度是 output_bits
-    head = HeadingBinaryHead(feat_dim, num_bits=output_bits, hidden_dim=256, dropout=0.3).to(device)
+    # 双流航向模型 (绝对航向 + 相对航向)
+    dual_heading_model = DualHeadingModel(
+        in_channels=in_ch,
+        feat_dim=feat_dim,
+        num_bits=output_bits,
+        hidden_dim=256,
+        dropout=0.3
+    ).to(device)
 
     # 训练
     print("\n🎯 训练步长模型")
     train_length_model(extractor_len, reg_len, train_loader, val_loader, ckpt_dir, curve_dir)
-    
-    print("\n🎯 训练航向分类模型 (Binary)")
-    train_heading_classifier(extractor_head, head, train_loader, val_loader, 
+
+    print("\n🎯 训练双流航向模型 (Abs + Rel)")
+    train_dual_heading_model(dual_heading_model, train_loader, val_loader,
                             ckpt_dir, curve_dir, quantizer)
     
     print("\n✅ 训练完成")
