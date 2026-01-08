@@ -8,6 +8,42 @@ def wrap_angle(angle):
     """将角度归一化到 [-pi, pi] 范围，支持标量或数组。"""
     return (angle + np.pi) % (2 * np.pi) - np.pi
 
+
+def rotate_to_global(acc_data, gyro_data, ori_data):
+    """
+    利用四元数将加速度计和陀螺仪数据从设备坐标系旋转到世界坐标系
+
+    参数:
+    - acc_data: 加速度数据 (N, 3)，设备坐标系
+    - gyro_data: 陀螺仪数据 (N, 3)，设备坐标系
+    - ori_data: 姿态四元数 (N, 4)，格式为 [w, x, y, z]
+
+    返回:
+    - acc_global: 世界坐标系下的加速度 (N, 3)
+    - gyro_global: 世界坐标系下的角速度 (N, 3)
+    """
+    acc_global = []
+    gyro_global = []
+
+    for i in range(len(acc_data)):
+        # 获取当前时刻的四元数
+        q = quaternion.from_float_array(ori_data[i])
+
+        # 计算旋转矩阵 (从设备坐标系到世界坐标系)
+        rotation_matrix = quaternion.as_rotation_matrix(q)
+
+        # 旋转加速度向量
+        acc_local = acc_data[i]
+        acc_world = rotation_matrix @ acc_local
+        acc_global.append(acc_world)
+
+        # 旋转角速度向量 (注意：角速度的转换需要考虑四元数的共轭)
+        gyro_local = gyro_data[i]
+        gyro_world = rotation_matrix @ gyro_local
+        gyro_global.append(gyro_world)
+
+    return np.array(acc_global), np.array(gyro_global)
+
 def moving_average(x, k):
     """简易滑动平均滤波，窗口 k>=1；k<=1 时原样返回。"""
     if k is None or k <= 1:
@@ -81,46 +117,23 @@ def load_oxiod_raw(imu_data_filename, gt_data_filename):
 def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode = "2d", window_size = 160, stride = 36, filter_window = 20, smooth_heading = True, heading_sigma = 5, smooth_length = False, length_sigma = 5):
     mid = window_size // 2 - stride // 2
     if mode == "2d":
+        # [新增] 将IMU数据旋转到世界坐标系
+        acc_data, gyro_data = rotate_to_global(acc_data, gyro_data, ori_data)
+
         pos2d = pos_data[:, :2]
         if filter_window and filter_window > 1:
             pos2d = moving_average(pos2d, filter_window)
 
-        # [修改] 使用 Chord Angle (弦角) 而非 Instantaneous Course (切线角)
-        # 不需要预先计算 yaw_series
-
+        # [修改] 使用绝对航向而非相对航向变化
         x_gyro = []
         x_acc = []
         y_len = []
         y_head = []
         
         # 初始化
-        # 为了计算 chord_angle_prev，我们需要知道前一个窗口的弦角
-        # 但是窗口是独立的样本。
-        # 这里的关键是：我们定义的 y_head (dh) 是 "当前步的弦角" - "前一步的弦角"
-        # 因此我们需要在遍历时维护状态，或者根据索引回溯。
-        
-        # 由于我们是按照 stride 遍历的，idx 对应的是 step start。
-        # idx 序列: 0, stride, 2*stride, ...
-        # step k: P[idx + mid - stride/2] -> P[idx + mid + stride/2]
-        # let center_idx = idx + mid
-        # step k: P[center_idx - stride/2] -> P[center_idx + stride/2]
-        # start_k = center_idx - stride/2
-        # end_k   = center_idx + stride/2
-        # chord_k = atan2(P[end_k] - P[start_k])
-        
-        # prev step (k-1): start_prev = start_k - stride, end_prev = end_k - stride = start_k
-        # chord_prev = atan2(P[end_prev] - P[start_prev]) = atan2(P[start_k] - P[start_k - stride])
-        
-        # 因此，对于每个 idx，我们可以直接计算当前弦角和前一个弦角。
-        
-        # 计算初始位置和航向 (用于重建)
-        # 重建时，初始状态是 P0 和 H0.
-        # 第一步预测 L0, dH0. 更新: H1 = H0 + dH0. P1 = P0 + L0 * u(H1).
-        # 我们希望 P1 落在真值上，所以 H1 必须是 chord_0 的角度。
-        # 即 H0 + dH0 = chord_0.
-        # 如果我们设 H0 = chord_0 (即 init_head 为第一步的弦角)，则 dH0 应该为 0。
-        # 随后的步骤 dH_k = chord_k - chord_{k-1}.
-        
+        # [修改] 使用绝对航向而非相对航向变化
+        # 每个样本的标签是当前步的绝对位移方向
+
         # init_pos 取第一个窗口的起点 (a)
         idx_0 = 0
         a_0 = idx_0 + window_size // 2 - stride // 2
@@ -128,12 +141,11 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode = "2d", window_
         # 确保索引安全
         a_0 = max(0, min(a_0, len(pos2d)-1))
         b_0 = max(0, min(b_0, len(pos2d)-1))
-        
+
         init_pos = pos2d[a_0, :]
-        
-        # 计算第一个 chord angle 作为 init_head
-        diff_0 = pos2d[b_0] - pos2d[a_0]
-        init_head = float(np.arctan2(diff_0[1], diff_0[0]))
+
+        # [修改] 对于绝对航向，我们不需要init_head，因为模型直接预测绝对航向
+        init_head = 0.0  # 设为0，不再使用
 
         max_start = gyro_data.shape[0] - window_size - 1
         for i, idx in enumerate(range(0, max_start, stride)):
@@ -156,38 +168,16 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode = "2d", window_
             # 1. 步长 (弦长)
             delta_len = np.linalg.norm(pb - pa)
 
-            # 2. 当前弦角
+            # 2. [修改] 绝对航向：当前步的位移方向
             curr_diff = pb - pa
-            # 处理静止情况，防止 NaN (虽然 OXIOD 数据通常在动)
+            # 处理静止情况，防止 NaN
             if np.linalg.norm(curr_diff) < 1e-6:
-                curr_chord_angle = 0.0 if i == 0 else prev_chord_angle # 保持不变
+                abs_heading = 0.0  # 静止时设为0
             else:
-                curr_chord_angle = np.arctan2(curr_diff[1], curr_diff[0])
-
-            # 3. 航向变化量 (dh)
-            if i == 0:
-                # 第一步，如果 init_head = curr_chord_angle，则 dh = 0
-                delta_head = 0.0
-            else:
-                # 计算前一步的弦角
-                # 前一步是从 a-stride 到 a (即 current a 是上一布的 b)
-                prev_a = a - stride
-                if prev_a < 0:
-                    # 理论上不应发生，除非 stride > a
-                    # fallback
-                    delta_head = 0.0
-                else:
-                    prev_p = pos2d[prev_a]
-                    prev_diff = pa - prev_p
-                    if np.linalg.norm(prev_diff) < 1e-6:
-                        prev_chord_angle = curr_chord_angle
-                    else:
-                        prev_chord_angle = np.arctan2(prev_diff[1], prev_diff[0])
-                    
-                    delta_head = wrap_angle(curr_chord_angle - prev_chord_angle)
+                abs_heading = np.arctan2(curr_diff[1], curr_diff[0])
 
             y_len .append(np.array([delta_len], dtype=np.float32))
-            y_head.append(np.array([delta_head], dtype=np.float32))
+            y_head.append(np.array([abs_heading], dtype=np.float32))
 
         x_gyro = np.array(x_gyro)
         x_acc  = np.array(x_acc)

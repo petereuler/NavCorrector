@@ -42,7 +42,7 @@ show_full_trajectory = True  # 设置为True时显示完整轨迹，忽略vis_nu
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 batch_size = 256
-dataset = "RONIN"
+dataset = "OXIOD"
 
 # 航向角量化参数（必须与 trainc.py 一致）
 num_bits = 8  # 必须是 4 的倍数
@@ -181,7 +181,7 @@ def main():
     data_root = os.path.join(project_dir, "OXIOD")
     selfmade_root = os.path.join(project_dir, "SELFMADE")
     ronin_root = os.path.join(project_dir, "RONIN")
-    ckpt_dir = os.path.join(project_dir, "checkpoints_cls")
+    ckpt_dir = os.path.join(project_dir, f"checkpoints_cls_{dataset}")
     output_dir = os.path.join(project_dir, f"output/testc_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(output_dir, exist_ok=True)
 
@@ -296,7 +296,7 @@ def main():
             window_size=window_size,
             stride=stride,
             filter_window=filter_window,
-            smooth_heading=True,  # 启用航向角平滑，与训练时保持一致
+            smooth_heading=False,  # 启用航向角平滑，与训练时保持一致
             heading_sigma=1.5,    # 航向角高斯平滑标准差
             smooth_length=False,   # 不平滑步长，只平滑航向
             length_sigma=1.0,    # 步长高斯平滑标准差
@@ -375,14 +375,15 @@ def main():
             file_prefix
         )
 
-        # 生成轨迹（基于步长+航向角累积）
-        traj_gt = generate_trajectory_2d(init_l, init_h, dl, dh[:len(dl)])
-        traj_pred = generate_trajectory_2d(init_l, init_h, pred_len, pred_head_soft[:len(pred_len)])
+        # [修改] 生成轨迹（基于步长+绝对航向）
+        # 对于绝对航向，不再需要传入init_h（设为0即可）
+        traj_gt = generate_trajectory_2d(init_l, 0.0, dl, dh[:len(dl)])
+        traj_pred = generate_trajectory_2d(init_l, 0.0, pred_len, pred_head_soft[:len(pred_len)])
         
         # 生成平滑前的轨迹（用于对比）
         traj_gt_raw = None
         if dl_raw is not None and dh_raw is not None:
-            traj_gt_raw = generate_trajectory_2d(init_l_raw, init_h_raw, dl_raw, dh_raw[:len(dl_raw)])
+            traj_gt_raw = generate_trajectory_2d(init_l_raw, 0.0, dl_raw, dh_raw[:len(dl_raw)])
 
         # 计算 dataset_OXIOD 中使用的起始索引
         start_frame_idx = window_size // 2 - stride // 2  # 例如 160//2 - 32//2 = 64
@@ -466,19 +467,15 @@ def main():
         plot_trajectory_comparison(traj_gt, traj_gt_xy, traj_pred, output_dir, base_name,
                                  traj_gt_raw=traj_gt_raw, traj_pdr=traj_pdr, vis_num=vis_len if show_full_trajectory else None)
 
-        # ==================== 新增：真值 vs 预测 双箭头矢量图 ====================
-        
-        # 1. 准备预测值的绝对航向 (N,)
-        dh_pred_steps = pred_head_soft[:len(pred_vis)-1, 0]
-        cum_headings_pred = init_h + np.cumsum(dh_pred_steps)
-        vis_headings_pred = np.concatenate([[init_h], cum_headings_pred])
-        
-        # 2. 准备真值的绝对航向 (N,)
-        # dh 是真值变化量，长度通常 >= len(pred_vis)
-        # 我们截取对应的长度
-        dh_gt_steps = dh[:len(pred_vis)-1, 0]
-        cum_headings_gt = init_h + np.cumsum(dh_gt_steps)
-        vis_headings_gt = np.concatenate([[init_h], cum_headings_gt])
+        # ==================== [修改] 新增：真值 vs 预测 双箭头矢量图 ====================
+
+        # 1. [修改] 准备预测值的绝对航向 (N,)
+        # 对于绝对航向，pred_head_soft已经是绝对航向，直接使用
+        vis_headings_pred = pred_head_soft[:len(pred_vis), 0]
+
+        # 2. [修改] 准备真值的绝对航向 (N,)
+        # 对于绝对航向，dh已经是绝对航向，直接使用
+        vis_headings_gt = dh[:len(pred_vis), 0]
         
         # 3. 调用绘图
         plot_trajectory_with_quiver(
@@ -495,28 +492,26 @@ def main():
 
         # ==================== 新增：瞬时转向误差双箭头分析图 ====================
         
-        # A. 准备基础数据
-        # 截取长度对齐 (N-1)
-        steps_len = len(pred_vis) - 1
-        dh_pred_steps = pred_head_soft[:steps_len, 0]  # 预测的转向 (dtheta)
-        dh_gt_steps = dh[:steps_len, 0]                # 真值的转向 (dtheta)
-        
-        # B. 计算预测绝对航向 (Red Arrow Data)
-        cum_headings_pred = init_h + np.cumsum(dh_pred_steps)
-        vis_headings_pred = np.concatenate([[init_h], cum_headings_pred])
-        
-        # C. 计算"局部真值"航向 (Purple Arrow Data)
-        # 逻辑：Local_Truth = Pred_Heading + (GT_Turn - Pred_Turn)
-        # 这消除了历史累积误差，只展示"这一步"的转向误差
-        
-        # 计算瞬时转向误差
-        turn_error = dh_gt_steps - dh_pred_steps
-        
-        # 构造局部真值数组
-        # 第0步完全重合
-        # 从第1步开始，局部真值 = 预测值 + 误差
-        vis_headings_local_truth = vis_headings_pred.copy()
-        vis_headings_local_truth[1:] = vis_headings_pred[1:] + turn_error
+        # A. [修改] 准备基础数据 - 对于绝对航向
+        # 截取长度对齐 (N)
+        steps_len = len(pred_vis)
+        abs_h_pred = pred_head_soft[:steps_len, 0]  # 预测的绝对航向
+        abs_h_gt = dh[:steps_len, 0]                 # 真值的绝对航向
+
+        # B. [修改] 预测绝对航向 (Red Arrow Data)
+        vis_headings_pred = abs_h_pred
+
+        # C. [修改] 计算"局部真值"航向 (Purple Arrow Data)
+        # 对于绝对航向，我们直接使用真值的绝对航向作为局部真值
+        # 因为绝对航向没有累积误差问题
+        vis_headings_local_truth = abs_h_gt
+
+        # 计算瞬时转向误差（用于打印信息）
+        # 从绝对航向计算转向变化
+        if len(abs_h_pred) > 1:
+            turn_pred = np.diff(abs_h_pred)
+            turn_gt = np.diff(abs_h_gt)
+            turn_error = turn_gt - turn_pred
         
         # D. 调用绘图
         plot_trajectory_turn_error_quiver(
@@ -530,9 +525,12 @@ def main():
         print(f"  瞬时转向误差分析图保存至: {base_name}_turn_error_quiver.png")
         
         # 打印最大突变点，方便在Log中快速定位
-        max_err_idx = np.argmax(np.abs(turn_error))
-        max_err_deg = np.degrees(np.abs(turn_error[max_err_idx]))
-        print(f"  > 最大单步转向突变: {max_err_deg:.2f}° (at step {max_err_idx})")
+        if len(abs_h_pred) > 1:
+            max_err_idx = np.argmax(np.abs(turn_error))
+            max_err_deg = np.degrees(np.abs(turn_error[max_err_idx]))
+            print(f"  > 最大单步转向误差: {max_err_deg:.2f}° (at step {max_err_idx})")
+        else:
+            print(f"  > 数据长度不足，无法计算转向误差")
         
         # ====================================================================
 

@@ -97,15 +97,15 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d", window_si
         y_head = []
         
         # init_pos & init_head
+        # [修改] 对于绝对航向，我们不需要init_head，因为模型直接预测绝对航向
         idx_0 = 0
         a_0 = idx_0 + window_size // 2 - stride // 2
         b_0 = idx_0 + window_size // 2 + stride // 2
         a_0 = max(0, min(a_0, len(pos2d)-1))
         b_0 = max(0, min(b_0, len(pos2d)-1))
         init_pos = pos2d[a_0, :]
-        
-        diff_0 = pos2d[b_0] - pos2d[a_0]
-        init_head = float(np.arctan2(diff_0[1], diff_0[0]))
+
+        init_head = 0.0  # [修改] 设为0，不再使用
 
         max_start = gyro_data.shape[0] - window_size - 1
         for i, idx in enumerate(range(0, max_start, stride)):
@@ -122,31 +122,19 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d", window_si
             pa = pos2d[a, :]
             pb = pos2d[b, :]
             
+            # 1. 步长 (弦长)
             delta_len = np.linalg.norm(pb - pa)
-            
+
+            # 2. [修改] 绝对航向：当前步的位移方向
             curr_diff = pb - pa
+            # 处理静止情况，防止 NaN
             if np.linalg.norm(curr_diff) < 1e-6:
-                curr_chord_angle = 0.0 if i == 0 else prev_chord_angle
+                abs_heading = 0.0  # 静止时设为0
             else:
-                curr_chord_angle = np.arctan2(curr_diff[1], curr_diff[0])
-            
-            if i == 0:
-                delta_head = 0.0
-            else:
-                prev_a = a - stride
-                if prev_a < 0:
-                    delta_head = 0.0
-                else:
-                    prev_p = pos2d[prev_a]
-                    prev_diff = pa - prev_p
-                    if np.linalg.norm(prev_diff) < 1e-6:
-                        prev_chord_angle = curr_chord_angle
-                    else:
-                        prev_chord_angle = np.arctan2(prev_diff[1], prev_diff[0])
-                    delta_head = wrap_angle(curr_chord_angle - prev_chord_angle)
-            
+                abs_heading = np.arctan2(curr_diff[1], curr_diff[0])
+
             y_len.append(np.array([delta_len], dtype=np.float32))
-            y_head.append(np.array([delta_head], dtype=np.float32))
+            y_head.append(np.array([abs_heading], dtype=np.float32))
 
         x_gyro = np.array(x_gyro)
         x_acc = np.array(x_acc)
@@ -168,8 +156,10 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d", window_si
             y_len_smooth = gaussian_filter1d(y_len.flatten(), sigma=length_sigma)
             y_len = y_len_smooth.reshape(-1, 1)
         
-        # 对航向角进行平滑处理（提高真值轨迹的光滑性）
-        if smooth_heading and len(y_head) > 0:
+        # [修改] 对绝对航向进行平滑处理
+        # 注意：绝对航向在 -pi/pi 边界有跳变，高斯平滑可能导致不正确的结果
+        # TODO: 实现专门处理角度跳变的平滑算法（如unwrap + smooth + wrap）
+        if False and smooth_heading and len(y_head) > 0:  # 暂时禁用平滑
             y_head_smooth = gaussian_filter1d(y_head.flatten(), sigma=heading_sigma)
             y_head = y_head_smooth.reshape(-1, 1)
         

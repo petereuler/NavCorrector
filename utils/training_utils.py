@@ -74,7 +74,7 @@ def load_data_2d_oxiod(data_root, device, window_size=160, stride=32):
             window_size=window_size,
             stride=stride,
             filter_window=20,
-            smooth_heading=True,  # 启用航向角平滑，提高真值轨迹光滑性
+            smooth_heading=False,  # 启用航向角平滑，提高真值轨迹光滑性
             heading_sigma=1.5,    # 航向角高斯平滑标准差
             smooth_length=False,   # 不平滑步长，只平滑航向
             length_sigma=1.0,    # 步长高斯平滑标准差

@@ -33,14 +33,14 @@ output_dim_len = 1
 # 航向角量化参数
 num_bits = 8  # 必须是 4 的倍数
 num_bins = 2 ** num_bits
-use_adaptive_quantization = False  # 启用自适应非均匀量化
+use_adaptive_quantization = False  # [修改] 绝对航向使用均匀量化，禁用自适应量化
 # 计算输出位数
 output_bits = num_bits
 
 # 优化器参数
 lr = 1e-4
 weight_decay = 1e-4
-epochs = 10
+epochs = 200
 
 # 训练模式：'adaptive' (余弦退火+早停) 或 'fixed' (固定学习率+固定轮数)
 train_mode = 'fixed'  # 'adaptive' or 'fixed'
@@ -49,7 +49,7 @@ early_stop_patience = 50  # 仅在 adaptive 模式下生效
 # 数据增强
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
-dataset = "RONIN"
+dataset = "OXIOD"
 
 # 从环境变量读取
 epochs = int(os.getenv('EPOCHS', epochs))
@@ -355,7 +355,7 @@ def main():
     data_root = os.path.join(project_dir, "OXIOD")
     selfmade_root = os.path.join(project_dir, "SELFMADE")
     ronin_root = os.path.join(project_dir, "RONIN")
-    ckpt_dir = os.path.join(project_dir, "checkpoints_cls")
+    ckpt_dir = os.path.join(project_dir, f"checkpoints_cls_{dataset}")
     os.makedirs(ckpt_dir, exist_ok=True)
     curve_dir = os.path.join(project_dir, "output", f"trainc_{time.strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(curve_dir, exist_ok=True)
@@ -363,11 +363,11 @@ def main():
     quantizer_path = os.path.join(ckpt_dir, "quantizer.json")
 
     print("="*60)
-    print("航向角量化分类训练（自适应非均匀量化版）")
+    print("航向角量化分类训练（绝对航向-均匀量化版）")
     print("="*60)
     print(f"  位数: {num_bits} bits -> {num_bins} bins")
     print(f"  输出位数: {output_bits} bits")
-    print(f"  自适应量化: {use_adaptive_quantization}")
+    print(f"  量化类型: {'均匀量化' if not use_adaptive_quantization else '自适应量化'}")
     print(f"  损失函数: HeadingBinaryLoss (二进制编码)")
     print(f"  训练模式: {train_mode} ({'固定学习率+固定轮数' if train_mode == 'fixed' else '余弦退火+早停'})")
     print(f"  学习率: {lr}, 权重衰减: {weight_decay}, 轮数: {epochs}")
@@ -403,14 +403,15 @@ def main():
         print(f"  发现已有量化器，从 {quantizer_path} 加载")
         quantizer.load(quantizer_path)
     else:
-        # 仅使用训练集数据拟合量化器（防止数据泄漏）
-        print("  使用训练集数据拟合量化器...")
-        # 断言确保只使用训练集
-        assert head_tr_np.shape[0] == len(x_tr), "量化器拟合数据必须仅包含训练集"
-        quantizer.fit(head_tr_np)
+        # [修改] 对于绝对航向，使用均匀量化而非自适应量化
+        print("  使用均匀量化初始化量化器...")
+        # 直接设置均匀分布的bin_edges
+        quantizer.bin_edges = np.linspace(-np.pi, np.pi, num_bins + 1)
+        quantizer.bin_centers = (quantizer.bin_edges[:-1] + quantizer.bin_edges[1:]) / 2
+        quantizer.fitted = True
         quantizer.save(quantizer_path)
     
-    # 绘制量化器分析图
+    # [修改] 对于均匀量化，仍然绘制分析图以便观察分布
     plot_quantizer_analysis(quantizer, head_tr_np, curve_dir, num_bins)
     
     train_dataset = TensorDataset(x_tr, ylen_tr, yhead_tr)
