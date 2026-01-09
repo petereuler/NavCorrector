@@ -185,7 +185,7 @@ def plot_trajectory_comparison(traj_gt, traj_gt_xy, traj_pred, output_dir, base_
 
 # ==================== 航向角可视化 ====================
 
-def plot_heading_analysis(dh, pred_head_soft, pred_head_hard, vis_num, output_path, quantizer, dh_raw=None):
+def plot_heading_analysis(dh, pred_head_soft, pred_head_hard, vis_num, output_path, quantizer=None, dh_raw=None):
     """绘制航向分类分析图
     
     Args:
@@ -240,15 +240,19 @@ def plot_heading_analysis(dh, pred_head_soft, pred_head_hard, vis_num, output_pa
     ax3.plot(t, np.degrees(error_hard), label=f'Hard Decode MAE: {np.degrees(error_hard.mean()):.2f}deg', 
              linewidth=1.0, color='tab:orange', alpha=0.6)
     
-    # 显示自适应量化信息
-    if quantizer.adaptive and quantizer.fitted:
+    # 显示量化信息（如果有量化器）
+    if quantizer is not None and hasattr(quantizer, 'adaptive') and quantizer.adaptive and quantizer.fitted:
         bin_widths = np.diff(quantizer.bin_edges)
         min_width = np.degrees(bin_widths.min())
         max_width = np.degrees(bin_widths.max())
-        ax3.axhline(y=min_width/2, color='green', linestyle=':', 
+        ax3.axhline(y=min_width/2, color='green', linestyle=':',
                     label=f'Min Quant Error: +/-{min_width/2:.2f}deg')
-        ax3.axhline(y=max_width/2, color='gray', linestyle=':', 
+        ax3.axhline(y=max_width/2, color='gray', linestyle=':',
                     label=f'Max Quant Error: +/-{max_width/2:.2f}deg')
+    elif quantizer is None:
+        # 对于回归方法，添加一个说明
+        ax3.text(0.02, 0.98, 'Regression Method\n(No Quantization)', transform=ax3.transAxes,
+                fontsize=10, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
     
     ax3.set_title("Heading Prediction Error", fontsize=16)
     ax3.set_ylabel("Absolute Error (deg)", fontsize=14)

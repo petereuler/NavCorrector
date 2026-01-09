@@ -46,7 +46,7 @@ batch_size = 256
 dataset = "OXIOD"
 
 # 航向角量化参数（必须与 trainc.py 一致）
-num_bits = 8  # 必须是 4 的倍数
+num_bits = 10  # 必须是 4 的倍数
 num_bins = 2 ** num_bits  # 4096 个 bin
 output_bits = num_bits
 encoding_mode = 'binary_code'
@@ -55,35 +55,19 @@ encoding_mode = 'binary_code'
 
 
 def load_models(ckpt_dir, device):
-    """加载预训练的模型和量化器"""
+    """加载预训练的双流航向回归模型"""
     input_dim = 6
     feature_dim = 64
-    
-    # 加载量化器（关键：必须使用训练时保存的量化器）
-    quantizer_path = os.path.join(ckpt_dir, "quantizer.json")
-    if os.path.exists(quantizer_path):
-        quantizer = HeadingQuantizer(num_bins=num_bins, use_gray_code=True, )
-        quantizer.load(quantizer_path)
-    else:
-        print(f"警告: 未找到量化器文件 {quantizer_path}，使用均匀量化")
-        quantizer = HeadingQuantizer(num_bins=num_bins, use_gray_code=True, )
-        # 手动设置均匀量化的边界
-        quantizer.bin_edges = np.linspace(-np.pi, np.pi, num_bins + 1)
-        quantizer.bin_centers = (quantizer.bin_edges[:-1] + quantizer.bin_edges[1:]) / 2
-        quantizer.fitted = True
-    
+
     models = {
         'extractor_len': FeatureExtractor(input_dim, feature_dim).to(device),
         'reg_len': RegressorHead(feature_dim, 1).to(device),
     }
 
-    # 双流航向模型
+    # 双流航向模型 (直接回归)
     models['dual_heading'] = DualHeadingModel(
         in_channels=input_dim,
-        feat_dim=feature_dim,
-        num_bits=output_bits,
-        hidden_dim=256,
-        dropout=0.3
+        feat_dim=feature_dim
     ).to(device)
 
     model_files = {
@@ -91,7 +75,7 @@ def load_models(ckpt_dir, device):
         'reg_len': 'reg_len.pth',
         'dual_heading': 'dual_heading_model.pth',
     }
-    
+
     for model_name, filename in model_files.items():
         model_path = os.path.join(ckpt_dir, filename)
         if os.path.exists(model_path):
@@ -100,16 +84,15 @@ def load_models(ckpt_dir, device):
             print(f"已加载模型: {filename}")
         else:
             print(f"警告: 未找到模型文件 {filename}")
-    
-    return models, quantizer
+
+    return models
 
 
-def predict_in_batches(models, quantizer, gx, ax, batch_size=256, fusion_alpha=0.1):
+def predict_in_batches(models, gx, ax, batch_size=256, fusion_alpha=0.1):
     """批量预测双流航向模型并进行互补滤波融合
 
     Args:
         models: 包含所有模型的字典
-        quantizer: 航向量化器
         gx: 陀螺仪数据
         ax: 加速度数据
         batch_size: 批次大小
@@ -119,7 +102,6 @@ def predict_in_batches(models, quantizer, gx, ax, batch_size=256, fusion_alpha=0
         pred_len: 预测步长
         pred_head_fused: 融合后的航向 (使用互补滤波)
         pred_head_abs: 绝对航向预测 (用于统计)
-        pred_binary_probs, pred_binary_hard, pred_logits: 二进制编码统计
     """
     n = gx.shape[0]
     preds_len = []
@@ -149,29 +131,24 @@ def predict_in_batches(models, quantizer, gx, ax, batch_size=256, fusion_alpha=0
             pred_l = models['reg_len'](feat_l)
 
             # === 2. 双流航向预测 ===
-            logits_abs, pred_rel = models['dual_heading'](xb)
+            pred_abs, pred_rel = models['dual_heading'](xb)
 
-            # === 3. 绝对航向解码 ===
-            # A. 硬解码 (用于统计)
-            probs = torch.sigmoid(logits_abs)
-            pred_binary = probs.cpu().numpy()
-            pred_binary_hard_batch = (pred_binary > 0.5).astype(np.int32)
+            # === 3. 直接使用回归输出 ===
+            pred_h_abs_batch = pred_abs.cpu().numpy()  # 绝对航向直接输出
 
-            # B. 软解码 (用于融合)
-            pred_h_abs_batch = quantizer.decode_soft_expectation(logits_abs).cpu().numpy()
+            # 为兼容性创建虚拟的二进制编码统计
+            pred_binary = np.zeros((pred_h_abs_batch.shape[0], num_bits))  # 虚拟二进制概率
+            pred_binary_hard_batch = np.zeros((pred_h_abs_batch.shape[0], num_bits), dtype=np.int32)  # 虚拟硬解码
 
             # === 4. 互补滤波融合 ===
             batch_size_current = pred_h_abs_batch.shape[0]
 
             # 初始化融合航向数组
-            if pred_h_abs_batch.ndim == 1:
-                fused_headings = np.zeros(batch_size_current)
-            else:
-                fused_headings = np.zeros((batch_size_current, pred_h_abs_batch.shape[1]))
+            fused_headings = np.zeros_like(pred_h_abs_batch)
 
             for i in range(batch_size_current):
                 # 当前批次中的绝对航向预测
-                abs_pred = pred_h_abs_batch[i] if pred_h_abs_batch.ndim == 1 else pred_h_abs_batch[i, 0]
+                abs_pred = pred_h_abs_batch[i, 0]
 
                 # 相对航向预测 (弧度)
                 rel_pred = pred_rel[i, 0].cpu().numpy()
@@ -184,10 +161,7 @@ def predict_in_batches(models, quantizer, gx, ax, batch_size=256, fusion_alpha=0
                     rel_integration = fused_heading_prev + rel_pred
                     fused_heading = (1 - fusion_alpha) * rel_integration + fusion_alpha * abs_pred
 
-                if fused_headings.ndim == 1:
-                    fused_headings[i] = fused_heading
-                else:
-                    fused_headings[i, 0] = fused_heading
+                fused_headings[i, 0] = fused_heading
                 fused_heading_prev = fused_heading
 
             # === 5. 收集结果 ===
@@ -196,10 +170,10 @@ def predict_in_batches(models, quantizer, gx, ax, batch_size=256, fusion_alpha=0
             preds_head_abs.append(pred_h_abs_batch.reshape(-1, 1))
             preds_binary_probs.append(pred_binary)
             preds_binary_hard.append(pred_binary_hard_batch)
-            preds_logits.append(logits_abs.cpu().numpy())
+            preds_logits.append(pred_abs.cpu().numpy())  # 使用pred_abs而不是logits_abs
 
             # 清理显存
-            del xb, feat_l, pred_l, logits_abs, pred_rel
+            del xb, feat_l, pred_l, pred_abs, pred_rel
 
     # 合并所有批次的结果
     pred_len = np.concatenate(preds_len, axis=0)
@@ -222,24 +196,18 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     print("="*60)
-    print("航向角量化分类测试（自适应非均匀量化版）")
+    print("双流航向回归测试（绝对航向 + 相对航向，直接回归）")
     print("="*60)
-    print(f"  编码模式: {encoding_mode}")
-    print(f"  位数: {num_bits} bits -> {num_bins} bins")
+    print(f"  模型结构: DualHeadingModel (基于ResNet回归)")
+    print(f"  绝对航向: 直接回归 [-π, π]")
+    print(f"  相对航向: 直接回归 Δθ")
+    print(f"  融合方式: 互补滤波 (α=0.1)")
     print("="*60)
 
-    # 加载模型和量化器
-    print("\n正在加载预训练模型和量化器...")
-    models, quantizer = load_models(ckpt_dir, device)
+    # 加载模型
+    print("\n正在加载预训练双流模型...")
+    models = load_models(ckpt_dir, device)
     print("模型加载完成！")
-    
-    # 打印量化器信息
-    if quantizer.fitted:
-        bin_widths = np.diff(quantizer.bin_edges)
-        print(f"\n量化器信息:")
-        print(f"  类型: {'自适应' if quantizer.adaptive else '均匀'}")
-        print(f"  Bin 宽度范围: [{np.degrees(bin_widths.min()):.2f}deg, {np.degrees(bin_widths.max()):.2f}deg]")
-        print(f"  Bin 宽度中位数: {np.degrees(np.median(bin_widths)):.2f}deg")
 
     # 测试文件列表
     if dataset == "SELFMADE" and os.path.isdir(selfmade_root):
@@ -341,7 +309,7 @@ def main():
         # 为兼容性，将绝对航向作为主要航向
         dh_raw = dh_abs_raw
         dh = dh_abs
-
+        
         if gx.shape[0] == 0:
             print("窗口长度不足，跳过该序列")
             continue
@@ -357,12 +325,12 @@ def main():
         # 预测（双流航向 + 互补滤波融合）
         fusion_alpha = 0.1  # 互补滤波权重
         pred_len, pred_head_fused, pred_head_abs, pred_binary_probs, pred_binary_hard, pred_logits = predict_in_batches(
-            models, quantizer, gx, ax, batch_size=batch_size, fusion_alpha=fusion_alpha
+            models, gx, ax, batch_size=batch_size, fusion_alpha=fusion_alpha
         )
 
         # 为了兼容性，将融合结果作为主要预测结果
-        pred_head_soft = pred_head_fused.reshape(-1, 1)  # 用于轨迹重建的主要航向
-        pred_head_hard = pred_head_abs.reshape(-1, 1)    # 用于统计的绝对航向
+        pred_head_soft = pred_head_fused  # 用于轨迹重建的主要航向
+        pred_head_hard = pred_head_abs    # 用于统计的绝对航向
     
         # 对齐数据长度
         min_len = min(len(dl), len(dh), len(pred_len), len(pred_head_soft), len(pred_head_hard))
@@ -400,25 +368,8 @@ def main():
             dl_raw = None
             dh_raw = None
         
-        # 编码错误统计和可视化（使用平滑前的真值）
-        file_prefix = base_name
-        # 使用平滑前的真值进行编码错误分析
-        dh_gt_for_encoding = dh_raw if dh_raw is not None else dh
-        dh_np = dh_gt_for_encoding[:len(pred_binary_probs)] if len(pred_binary_probs) <= len(dh_gt_for_encoding) else dh_gt_for_encoding
-        if isinstance(dh_np, torch.Tensor):
-            dh_np = dh_np.cpu().numpy()
-        if dh_np.ndim > 1:
-            dh_np = dh_np[:, 0] if dh_np.shape[1] == 1 else dh_np.flatten()
-        
-        analyze_encoding_errors(
-            dh_np,
-            pred_binary_probs,
-            pred_binary_hard,
-            quantizer,
-            output_bits,
-            output_dir,
-            file_prefix
-        )
+        # 对于回归方法，跳过编码错误分析（回归方法没有编码概念）
+        print(f"  跳过编码错误分析（回归方法）")
 
         # [修改] 生成轨迹（基于步长+绝对航向）
         # 对于绝对航向，不再需要传入init_h（设为0即可）
@@ -581,7 +532,7 @@ def main():
 
         plot_heading_analysis(dh, pred_head_soft, pred_head_hard, vis_len,
                              os.path.join(output_dir, f"{base_name}_heading_analysis.png"),
-                             quantizer, dh_raw=dh_raw)
+                             dh_raw=dh_raw)
 
         plot_time_series(dl, dh, pred_len, pred_head_soft, vis_len,
                         os.path.join(output_dir, f"{base_name}_time_series.png"),
@@ -612,9 +563,7 @@ def main():
     print(f"  平均 RMSE: {np.mean(all_rmse):.4f}m")
     print(f"  平均 Length MAE: {np.mean(all_len_mae):.4f}m")
     print(f"  平均 Heading MAE: {np.degrees(np.mean(all_head_mae)):.2f} deg")
-    if quantizer.fitted:
-        bin_widths = np.diff(quantizer.bin_edges)
-        print(f"  量化精度范围: [{np.degrees(bin_widths.min())/2:.2f}deg, {np.degrees(bin_widths.max())/2:.2f}deg]")
+    print(f"  模型类型: 直接回归 (无量化)")
     print("="*60)
 
     print(f"\n测试完成！结果保存在: {output_dir}")

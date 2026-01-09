@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import os
 import json
+from .regress import FeatureExtractor as RegFeatureExtractor, RegressorHead as RegHead
 
 
 # ==================== ResNet 基础模块 ====================
@@ -637,22 +638,22 @@ def compute_heading_mae(pred_heading, target_heading):
 
 class DualHeadingModel(torch.nn.Module):
     """
-    双流航向预测模型：
-    - 共享骨干网络 (FeatureExtractor)
-    - 绝对航向头：HeadingBinaryHead (二进制编码)
-    - 相对航向头：RegressorHead (直接回归Δθ)
+    双流航向预测模型（使用regress.py中的回归结构）：
+    - 共享骨干网络 (RegFeatureExtractor - ResNet)
+    - 绝对航向头：RegHead (直接回归绝对航向)
+    - 相对航向头：RegHead (直接回归相对航向变化)
     """
-    def __init__(self, in_channels, feat_dim=64, num_bits=8, hidden_dim=256, dropout=0.3):
+    def __init__(self, in_channels, feat_dim=64):
         super().__init__()
 
-        # 共享骨干网络
-        self.feature_extractor = FeatureExtractor(in_channels, feat_dim)
+        # 共享骨干网络 (使用regress.py中的ResNet结构)
+        self.feature_extractor = RegFeatureExtractor(in_channels, feat_dim)
 
-        # 绝对航向头 (二进制编码)
-        self.abs_head = HeadingBinaryHead(feat_dim, num_bits=num_bits, hidden_dim=hidden_dim, dropout=dropout)
+        # 绝对航向头 (使用regress.py中的回归结构)
+        self.abs_head = RegHead(feat_dim, output_dim=1)
 
-        # 相对航向头 (回归Δθ)
-        self.rel_head = RegressorHead(feat_dim, output_dim=1)
+        # 相对航向头 (使用regress.py中的回归结构)
+        self.rel_head = RegHead(feat_dim, output_dim=1)
 
     def forward(self, x):
         """

@@ -10,17 +10,15 @@ import matplotlib.pyplot as plt
 import quaternion
 
 from models.heading_classifier import (
-    FeatureExtractor, RegressorHead,
-    HeadingQuantizer, HeadingBinaryLoss,
-    compute_bit_accuracy, compute_heading_mae, HeadingBinaryHead,
-    DualHeadingModel, DualHeadingLoss
+    HeadingQuantizer, DualHeadingModel, DualHeadingLoss,
+    compute_heading_mae
 )
+from models.regress import FeatureExtractor as RegFeatureExtractor, RegressorHead as RegHead
 from utils.training_utils import (
     len_loss,
     load_data_2d_oxiod,
     load_data_2d_selfmade,
-    load_data_2d_ronin,
-    plot_quantizer_analysis
+    load_data_2d_ronin
 )
 
 
@@ -32,7 +30,7 @@ feat_dim = 64
 output_dim_len = 1
 
 # 航向角量化参数
-num_bits = 8  # 必须是 4 的倍数
+num_bits = 10  # 必须是 4 的倍数
 num_bins = 2 ** num_bits
 use_adaptive_quantization = False  # [修改] 绝对航向使用均匀量化，禁用自适应量化
 # 计算输出位数
@@ -160,8 +158,8 @@ def train_length_model(extractor, regressor, train_loader, val_loader, ckpt_dir,
 
 
 def train_dual_heading_model(model, train_loader, val_loader,
-                              ckpt_dir, curve_dir, quantizer):
-    """训练双流航向模型 (绝对航向 + 相对航向)"""
+                              ckpt_dir, curve_dir):
+    """训练双流航向模型 (绝对航向 + 相对航向，直接回归)"""
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     if train_mode == 'fixed':
@@ -169,21 +167,15 @@ def train_dual_heading_model(model, train_loader, val_loader,
     else:
         scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2)
 
-    # 初始化双流损失函数
+    # 初始化损失函数 (直接MSE)
+    abs_loss_fn = torch.nn.MSELoss()
+    rel_loss_fn = torch.nn.MSELoss()
     rel_weight = 10.0  # 相对航向损失权重
-    criterion = DualHeadingLoss(
-        num_bits=num_bits,
-        use_gray_code=True,
-        quantizer=quantizer,
-        circular_weight=0.0,  # 初始设为0，后续warmup
-        rel_weight=rel_weight
-    )
 
-    ckpts = [os.path.join(ckpt_dir, f) for f in ["dual_heading_extractor.pth", "dual_heading_model.pth"]]
+    ckpt_path = os.path.join(ckpt_dir, "dual_heading_model.pth")
 
-    if os.path.exists(ckpts[0]) and os.path.exists(ckpts[1]):
-        # 加载完整模型
-        checkpoint = torch.load(ckpts[1])
+    if os.path.exists(ckpt_path):
+        checkpoint = torch.load(ckpt_path)
         model.load_state_dict(checkpoint)
         print("[Dual Heading] 发现已有最佳模型，跳过训练")
         return
@@ -197,17 +189,10 @@ def train_dual_heading_model(model, train_loader, val_loader,
     no_improve = 0
 
     mode_str = "Fixed LR" if train_mode == 'fixed' else "Adaptive (Cosine+EarlyStop)"
-    print(f">>> 开始训练双流航向模型 (Abs+Rel, {mode_str})")
+    print(f">>> 开始训练双流航向模型 (Direct Regression, {mode_str})")
 
     for ep in range(epochs):
         t0 = time.time()
-
-        # Loss Warm-up: 前5轮不加几何约束，之后线性增加
-        if ep < 5:
-            current_geo_weight = 0.0
-        else:
-            current_geo_weight = 1.0  # 基础几何权重
-        criterion.abs_loss.circular_weight = current_geo_weight
 
         model.train()
         total_loss = 0.0
@@ -216,10 +201,12 @@ def train_dual_heading_model(model, train_loader, val_loader,
         cnt = 0
 
         for xb, _, yb_head_abs, yb_head_rel in train_loader:
-            logits_abs, pred_rel = model(xb)
+            pred_abs, pred_rel = model(xb)
 
             # 计算双流损失
-            loss, loss_dict = criterion(logits_abs, pred_rel, yb_head_abs, yb_head_rel)
+            loss_abs = abs_loss_fn(pred_abs, yb_head_abs)
+            loss_rel = rel_loss_fn(pred_rel, yb_head_rel)
+            loss = loss_abs + rel_weight * loss_rel
 
             optimizer.zero_grad()
             loss.backward()
@@ -228,8 +215,8 @@ def train_dual_heading_model(model, train_loader, val_loader,
 
             bs = xb.size(0)
             total_loss += loss.item() * bs
-            total_abs_loss += loss_dict['abs'] * bs
-            total_rel_loss += loss_dict['rel'] * bs
+            total_abs_loss += loss_abs.item() * bs
+            total_rel_loss += loss_rel.item() * bs
             cnt += bs
 
         if scheduler is not None:
@@ -243,28 +230,29 @@ def train_dual_heading_model(model, train_loader, val_loader,
         model.eval()
         vtotal = 0.0
         vcnt = 0
-        all_logits_abs = []
+        all_preds_abs = []
         all_targets_abs = []
 
         with torch.no_grad():
             for xb, _, yb_head_abs, yb_head_rel in val_loader:
-                logits_abs, pred_rel = model(xb)
-                loss, _ = criterion(logits_abs, pred_rel, yb_head_abs, yb_head_rel)
+                pred_abs, pred_rel = model(xb)
+
+                # 直接计算MAE
+                abs_mae = torch.abs(pred_abs - yb_head_abs).mean()
 
                 bs = xb.size(0)
-                vtotal += loss.item() * bs
+                vtotal += abs_mae.item() * bs
                 vcnt += bs
 
-                all_logits_abs.append(logits_abs)
+                all_preds_abs.append(pred_abs)
                 all_targets_abs.append(yb_head_abs)
 
         val_loss = vtotal / max(vcnt, 1)
 
-        # 计算绝对航向MAE (使用Soft Decoding)
-        all_logits_abs = torch.cat(all_logits_abs, dim=0)
+        # 计算绝对航向MAE (考虑角度周期性)
+        all_preds_abs = torch.cat(all_preds_abs, dim=0)
         all_targets_abs = torch.cat(all_targets_abs, dim=0)
-        pred_heading_abs = quantizer.decode_soft_expectation(all_logits_abs)
-        mae = compute_heading_mae(pred_heading_abs, all_targets_abs)
+        mae = compute_heading_mae(all_preds_abs, all_targets_abs)
 
         train_curve.append(avg_train_loss)
         val_curve.append(val_loss)
@@ -275,8 +263,7 @@ def train_dual_heading_model(model, train_loader, val_loader,
         # 保存最佳模型
         if mae.item() < best_mae:
             best_mae = mae.item()
-            torch.save(model.feature_extractor.state_dict(), ckpts[0])
-            torch.save(model.state_dict(), ckpts[1])
+            torch.save(model.state_dict(), ckpt_path)
             no_improve = 0
         else:
             no_improve += 1
@@ -322,8 +309,8 @@ def train_dual_heading_model(model, train_loader, val_loader,
     # 训练信息
     axes[1, 1].text(0.5, 0.5,
                     f"Dual Heading Model\n"
+                    f"(Direct Regression)\n"
                     f"Best MAE: {np.degrees(best_mae):.2f}deg\n"
-                    f"Num Bits: {num_bits}\n"
                     f"Rel Weight: {rel_weight}",
                     ha='center', va='center', fontsize=12,
                     transform=axes[1, 1].transAxes)
@@ -346,15 +333,14 @@ def main():
     curve_dir = os.path.join(project_dir, "output", f"trainc_{time.strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(curve_dir, exist_ok=True)
     
-    quantizer_path = os.path.join(ckpt_dir, "quantizer.json")
 
     print("="*60)
-    print("航向角量化分类训练（绝对航向-均匀量化版）")
+    print("双流航向回归训练（绝对航向 + 相对航向，直接回归）")
     print("="*60)
-    print(f"  位数: {num_bits} bits -> {num_bins} bins")
-    print(f"  输出位数: {output_bits} bits")
-    print(f"  量化类型: {'均匀量化' if not use_adaptive_quantization else '自适应量化'}")
-    print(f"  损失函数: HeadingBinaryLoss (二进制编码)")
+    print(f"  模型结构: DualHeadingModel (基于ResNet回归)")
+    print(f"  绝对航向: 直接回归 [-π, π]")
+    print(f"  相对航向: 直接回归 Δθ")
+    print(f"  损失函数: MSELoss (Abs) + 10×MSELoss (Rel)")
     print(f"  训练模式: {train_mode} ({'固定学习率+固定轮数' if train_mode == 'fixed' else '余弦退火+早停'})")
     print(f"  学习率: {lr}, 权重衰减: {weight_decay}, 轮数: {epochs}")
     print("="*60)
@@ -372,34 +358,14 @@ def main():
     print(f"验证集: {x_va.shape[0]} 样本")
     
     # 打印航向角分布
-    head_tr_np = yhead_abs_tr.cpu().numpy().flatten()
-    print(f"航向角范围: [{np.degrees(head_tr_np.min()):.1f}°, {np.degrees(head_tr_np.max()):.1f}°]")
-    print(f"航向角标准差: {np.degrees(head_tr_np.std()):.1f}°")
-    print(f"航向角中位数: {np.degrees(np.median(head_tr_np)):.1f}°")
-    
-    # 初始化量化器
-    print("\n📐 初始化量化器...")
-    quantizer = HeadingQuantizer(
-        num_bins=num_bins,
-        use_gray_code=True
-    )
-    
-    # 检查是否已有保存的量化器
-    if os.path.exists(quantizer_path):
-        print(f"  发现已有量化器，从 {quantizer_path} 加载")
-        quantizer.load(quantizer_path)
-    else:
-        # [修改] 对于绝对航向，使用均匀量化而非自适应量化
-        print("  使用均匀量化初始化量化器...")
-        # 直接设置均匀分布的bin_edges
-        quantizer.bin_edges = np.linspace(-np.pi, np.pi, num_bins + 1)
-        quantizer.bin_centers = (quantizer.bin_edges[:-1] + quantizer.bin_edges[1:]) / 2
-        quantizer.fitted = True
-        quantizer.save(quantizer_path)
-    
-    # [修改] 对于均匀量化，仍然绘制分析图以便观察分布
-    plot_quantizer_analysis(quantizer, head_tr_np, curve_dir, num_bins)
-    
+    head_abs_tr_np = yhead_abs_tr.cpu().numpy().flatten()
+    head_rel_tr_np = yhead_rel_tr.cpu().numpy().flatten()
+    print(f"绝对航向范围: [{np.degrees(head_abs_tr_np.min()):.1f}°, {np.degrees(head_abs_tr_np.max()):.1f}°]")
+    print(f"绝对航向标准差: {np.degrees(head_abs_tr_np.std()):.1f}°")
+    print(f"相对航向范围: [{np.degrees(head_rel_tr_np.min()):.1f}°, {np.degrees(head_rel_tr_np.max()):.1f}°]")
+    print(f"相对航向标准差: {np.degrees(head_rel_tr_np.std()):.1f}°")
+
+    # 创建数据集 (双流航向标签)
     train_dataset = TensorDataset(x_tr, ylen_tr, yhead_abs_tr, yhead_rel_tr)
     val_dataset = TensorDataset(x_va, ylen_va, yhead_abs_va, yhead_rel_va)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
@@ -409,29 +375,25 @@ def main():
     in_ch = x_tr.shape[-1]
     
     # 步长模型
-    extractor_len = FeatureExtractor(in_channels=in_ch, feat_dim=feat_dim).to(device)
-    reg_len = RegressorHead(feat_dim, output_dim_len).to(device)
+    extractor_len = RegFeatureExtractor(in_channels=in_ch, feat_dim=feat_dim).to(device)
+    reg_len = RegHead(feat_dim, output_dim_len).to(device)
     
-    # 双流航向模型 (绝对航向 + 相对航向)
+    # 双流航向模型 (绝对航向 + 相对航向，使用regress.py的结构)
     dual_heading_model = DualHeadingModel(
         in_channels=in_ch,
-        feat_dim=feat_dim,
-        num_bits=output_bits,
-        hidden_dim=256,
-        dropout=0.3
+        feat_dim=feat_dim
     ).to(device)
 
     # 训练
     print("\n🎯 训练步长模型")
     train_length_model(extractor_len, reg_len, train_loader, val_loader, ckpt_dir, curve_dir)
 
-    print("\n🎯 训练双流航向模型 (Abs + Rel)")
+    print("\n🎯 训练双流航向模型 (Abs + Rel, Direct Regression)")
     train_dual_heading_model(dual_heading_model, train_loader, val_loader,
-                            ckpt_dir, curve_dir, quantizer)
+                            ckpt_dir, curve_dir)
     
     print("\n✅ 训练完成")
     print(f"   检查点保存在: {ckpt_dir}")
-    print(f"   量化器保存在: {quantizer_path}")
     print(f"   训练曲线保存在: {curve_dir}")
 
 
