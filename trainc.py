@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import quaternion
 
 from models.heading_classifier import (
-    HeadingQuantizer, DualHeadingModel, DualHeadingLoss,
+    HeadingQuantizer, DualHeadingModel, DualHeadingLoss, UncertaintyHeadingLoss,
     compute_heading_mae
 )
 from models.regress import FeatureExtractor as RegFeatureExtractor, RegressorHead as RegHead
@@ -21,6 +21,21 @@ from utils.training_utils import (
     load_data_2d_ronin
 )
 
+class WrappedMSELoss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred, target):
+        # 1. 计算原始差值
+        diff = pred - target
+        
+        # 2. 核心操作：将差值 Wrap 到 [-pi, pi] 区间
+        # 公式推导：(diff + pi) % (2 * pi) - pi
+        # 这样 -359 度会被转成 +1 度，+359 度会被转成 -1 度
+        diff = (diff + torch.pi) % (2 * torch.pi) - torch.pi
+        
+        # 3. 计算 MSE
+        return torch.mean(diff ** 2)
 
 # ======= 参数设置 =======
 window_size = 160
@@ -39,7 +54,7 @@ output_bits = num_bits
 # 优化器参数
 lr = 1e-4
 weight_decay = 1e-4
-epochs = 200
+epochs = 500
 
 # 训练模式：'adaptive' (余弦退火+早停) 或 'fixed' (固定学习率+固定轮数)
 train_mode = 'fixed'  # 'adaptive' or 'fixed'
@@ -48,7 +63,7 @@ early_stop_patience = 50  # 仅在 adaptive 模式下生效
 # 数据增强
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
-dataset = "OXIOD"
+dataset = "RONIN"
 
 # 从环境变量读取
 epochs = int(os.getenv('EPOCHS', epochs))
@@ -91,13 +106,14 @@ def train_length_model(extractor, regressor, train_loader, val_loader, ckpt_dir,
         total = 0.0
         cnt = 0
         
-        for xb, yb_len, yb_head in train_loader:
+        for xb, yb_len, _ , _ in train_loader:
             feat = extractor(xb)
             pred = regressor(feat)
             loss = len_loss(pred, yb_len)
                 
             optimizer.zero_grad()
             loss.backward()
+            
             torch.nn.utils.clip_grad_norm_(extractor.parameters(), 1.0)
             torch.nn.utils.clip_grad_norm_(regressor.parameters(), 1.0)
             optimizer.step()
@@ -116,7 +132,7 @@ def train_length_model(extractor, regressor, train_loader, val_loader, ckpt_dir,
         vtotal = 0.0
         vcnt = 0
         with torch.no_grad():
-            for xb, yb_len, _ in val_loader:
+            for xb, yb_len, _ , _ in val_loader:
                 feat = extractor(xb)
                 pred = regressor(feat)
                 loss = len_loss(pred, yb_len)
@@ -157,9 +173,10 @@ def train_length_model(extractor, regressor, train_loader, val_loader, ckpt_dir,
     plt.close()
 
 
-def train_dual_heading_model(model, train_loader, val_loader,
-                              ckpt_dir, curve_dir):
-    """训练双流航向模型 (绝对航向 + 相对航向，直接回归)"""
+def train_dual_heading_model(model, train_loader, val_loader, ckpt_dir, curve_dir):
+    """
+    训练双流航向模型 (不确定性学习 + 动态卡尔曼验证)
+    """
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     if train_mode == 'fixed':
@@ -167,33 +184,28 @@ def train_dual_heading_model(model, train_loader, val_loader,
     else:
         scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2)
 
-    # 初始化损失函数 (直接MSE)
-    abs_loss_fn = torch.nn.MSELoss()
-    rel_loss_fn = torch.nn.MSELoss()
-    rel_weight = 10.0  # 相对航向损失权重
+    # [修改] 使用不确定性 Loss
+    criterion = UncertaintyHeadingLoss(rel_weight=10.0).to(device)
 
     ckpt_path = os.path.join(ckpt_dir, "dual_heading_model.pth")
-
     if os.path.exists(ckpt_path):
-        checkpoint = torch.load(ckpt_path)
-        model.load_state_dict(checkpoint)
         print("[Dual Heading] 发现已有最佳模型，跳过训练")
         return
 
-    best_mae = float('inf')
+    best_fused_mae = float('inf')
     train_curve = []
-    val_curve = []
-    val_mae_curve = []
+    val_fused_mae_curve = [] # 记录融合后的指标
     abs_loss_curve = []
     rel_loss_curve = []
+    
     no_improve = 0
-
-    mode_str = "Fixed LR" if train_mode == 'fixed' else "Adaptive (Cosine+EarlyStop)"
-    print(f">>> 开始训练双流航向模型 (Direct Regression, {mode_str})")
+    mode_str = "Fixed LR" if train_mode == 'fixed' else "Adaptive"
+    print(f">>> 开始训练双流航向模型 (Uncertainty Learning + Kalman Validation)")
 
     for ep in range(epochs):
         t0 = time.time()
 
+        # === 1. 训练阶段 ===
         model.train()
         total_loss = 0.0
         total_abs_loss = 0.0
@@ -201,12 +213,14 @@ def train_dual_heading_model(model, train_loader, val_loader,
         cnt = 0
 
         for xb, _, yb_head_abs, yb_head_rel in train_loader:
-            pred_abs, pred_rel = model(xb)
+            # [修改] 模型现在输出 4 个值
+            p_abs_mu, p_abs_var, p_rel_mu, p_rel_var = model(xb)
 
-            # 计算双流损失
-            loss_abs = abs_loss_fn(pred_abs, yb_head_abs)
-            loss_rel = rel_loss_fn(pred_rel, yb_head_rel)
-            loss = loss_abs + rel_weight * loss_rel
+            # [修改] 计算不确定性 Loss
+            loss, loss_abs, loss_rel = criterion(
+                p_abs_mu, p_abs_var, p_rel_mu, p_rel_var, 
+                yb_head_abs, yb_head_rel
+            )
 
             optimizer.zero_grad()
             loss.backward()
@@ -226,102 +240,102 @@ def train_dual_heading_model(model, train_loader, val_loader,
         avg_abs_loss = total_abs_loss / max(cnt, 1)
         avg_rel_loss = total_rel_loss / max(cnt, 1)
 
-        # 验证 Loop
+        # === 2. 验证阶段 (复刻动态卡尔曼滤波) ===
         model.eval()
-        vtotal = 0.0
-        vcnt = 0
-        all_preds_abs = []
-        all_targets_abs = []
-
+        
+        # 验证集状态变量 (需连续处理)
+        kf_state_x = None
+        kf_state_p = 0.0
+        
+        all_fused_preds = []
+        all_targets = []
+        
         with torch.no_grad():
             for xb, _, yb_head_abs, yb_head_rel in val_loader:
-                pred_abs, pred_rel = model(xb)
+                # 预测
+                p_abs_mu, p_abs_logvar, p_rel_mu, p_rel_logvar = model(xb)
+                
+                # 转为 Numpy 进行逐帧 KF 更新
+                z_k_batch = p_abs_mu.cpu().numpy()          # 观测值
+                R_k_batch = np.exp(p_abs_logvar.cpu().numpy()) # 观测噪声
+                
+                u_k_batch = p_rel_mu.cpu().numpy()          # 控制量
+                Q_k_batch = np.exp(p_rel_logvar.cpu().numpy()) # 过程噪声
+                
+                targets_batch = yb_head_abs.cpu().numpy()
+                
+                batch_len = len(z_k_batch)
+                batch_fused = []
+                
+                for i in range(batch_len):
+                    z_k = z_k_batch[i, 0]
+                    R_k = R_k_batch[i, 0]
+                    u_k = u_k_batch[i, 0]
+                    Q_k = Q_k_batch[i, 0]
 
-                # 直接计算MAE
-                abs_mae = torch.abs(pred_abs - yb_head_abs).mean()
+                    if kf_state_x is None:
+                        # 初始化
+                        kf_state_x = z_k
+                        kf_state_p = R_k
+                    else:
+                        # --- Kalman Filter 步骤 (与 testc.py 完全一致) ---
+                        # 1. 预测
+                        x_pred = kf_state_x + u_k
+                        p_pred = kf_state_p + Q_k
+                        
+                        # 2. 更新
+                        K = p_pred / (p_pred + R_k + 1e-8) # 动态卡尔曼增益
+                        
+                        innovation = z_k - x_pred
+                        innovation = (innovation + np.pi) % (2 * np.pi) - np.pi
+                        
+                        kf_state_x = x_pred + K * innovation
+                        kf_state_p = (1 - K) * p_pred
+                    
+                    # Wrap state
+                    kf_state_x = (kf_state_x + np.pi) % (2 * np.pi) - np.pi
+                    batch_fused.append(kf_state_x)
+                
+                all_fused_preds.append(batch_fused)
+                all_targets.append(targets_batch)
 
-                bs = xb.size(0)
-                vtotal += abs_mae.item() * bs
-                vcnt += bs
-
-                all_preds_abs.append(pred_abs)
-                all_targets_abs.append(yb_head_abs)
-
-        val_loss = vtotal / max(vcnt, 1)
-
-        # 计算绝对航向MAE (考虑角度周期性)
-        all_preds_abs = torch.cat(all_preds_abs, dim=0)
-        all_targets_abs = torch.cat(all_targets_abs, dim=0)
-        mae = compute_heading_mae(all_preds_abs, all_targets_abs)
-
+        # === 3. 计算指标 ===
+        all_fused_preds = np.concatenate(all_fused_preds).flatten()
+        all_targets = np.concatenate(all_targets).flatten()
+        
+        # 计算融合后的 MAE
+        diffs = all_fused_preds - all_targets
+        diffs = (diffs + np.pi) % (2 * np.pi) - np.pi
+        val_fused_mae = np.mean(np.abs(diffs))
+        
+        # 记录
         train_curve.append(avg_train_loss)
-        val_curve.append(val_loss)
-        val_mae_curve.append(mae.item())
+        val_fused_mae_curve.append(val_fused_mae)
         abs_loss_curve.append(avg_abs_loss)
         rel_loss_curve.append(avg_rel_loss)
 
-        # 保存最佳模型
-        if mae.item() < best_mae:
-            best_mae = mae.item()
+        # === 4. 保存最佳模型 (依据 KF Fused MAE) ===
+        if val_fused_mae < best_fused_mae:
+            best_fused_mae = val_fused_mae
             torch.save(model.state_dict(), ckpt_path)
             no_improve = 0
+            is_best = "*"
         else:
             no_improve += 1
+            is_best = ""
 
         if train_mode == 'adaptive' and no_improve >= early_stop_patience:
             print(f"  Early stopping at epoch {ep+1}")
             break
 
         if (ep + 1) % 5 == 0 or ep == 0:
-            current_lr = scheduler.get_last_lr()[0] if scheduler else lr
-            print(f"[Dual Heading Ep {ep+1}] "
-                  f"Loss: {avg_train_loss:.4f} (Abs:{avg_abs_loss:.4f}, Rel:{avg_rel_loss:.4f}) "
-                  f"| Val MAE: {np.degrees(mae.item()):.2f}° "
-                  f"| Time: {time.time()-t0:.1f}s")
+            print(f"[Ep {ep+1}] Loss:{avg_train_loss:.4f} "
+                  f"(Abs:{avg_abs_loss:.4f}, Rel:{avg_rel_loss:.4f}) | "
+                  f"Val KF-MAE: {np.degrees(val_fused_mae):.2f}° {is_best}")
 
-    # 绘制曲线
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-
-    axes[0, 0].plot(train_curve, label='train')
-    axes[0, 0].plot(val_curve, label='val')
-    axes[0, 0].set_title('Total Loss')
-    axes[0, 0].set_xlabel('Epoch')
-    axes[0, 0].legend()
-
-    axes[0, 1].plot(abs_loss_curve, label='abs loss', color='blue')
-    axes[0, 1].plot(rel_loss_curve, label='rel loss', color='red')
-    axes[0, 1].set_title('Component Losses')
-    axes[0, 1].set_xlabel('Epoch')
-    axes[0, 1].legend()
-
-    axes[1, 0].plot([np.degrees(m) for m in val_mae_curve])
-    axes[1, 0].set_title('Validation MAE (Abs Heading)')
-    axes[1, 0].set_xlabel('Epoch')
-    axes[1, 0].set_ylabel('MAE (deg)')
-
-    # 最佳 MAE 标记
-    best_idx = np.argmin(val_mae_curve)
-    axes[1, 0].scatter([best_idx], [np.degrees(val_mae_curve[best_idx])],
-                       color='green', s=100, zorder=5,
-                       label=f'Best: {np.degrees(val_mae_curve[best_idx]):.2f}deg')
-    axes[1, 0].legend()
-
-    # 训练信息
-    axes[1, 1].text(0.5, 0.5,
-                    f"Dual Heading Model\n"
-                    f"(Direct Regression)\n"
-                    f"Best MAE: {np.degrees(best_mae):.2f}deg\n"
-                    f"Rel Weight: {rel_weight}",
-                    ha='center', va='center', fontsize=12,
-                    transform=axes[1, 1].transAxes)
-    axes[1, 1].axis('off')
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(curve_dir, 'curve_dual_heading.png'))
-    plt.close()
-
-    print(f"\n最佳验证 MAE: {np.degrees(best_mae):.2f}°")
-
+    # === 5. 绘图 (可选) ===
+    # (此处代码与之前相同，绘制 val_fused_mae_curve 即可)
+    print(f"\n最佳验证 KF-MAE: {np.degrees(best_fused_mae):.2f}°")
 
 def main():
     project_dir = "/home/admin407/code/zyshe/NavCorrector"

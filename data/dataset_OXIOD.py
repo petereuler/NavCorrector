@@ -114,10 +114,10 @@ def load_oxiod_raw(imu_data_filename, gt_data_filename):
 
     return gyro_data, acc_data, pos_data, ori_data
 
-def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode = "2d", window_size = 160, stride = 36, filter_window = 20, smooth_heading = True, heading_sigma = 5, smooth_length = False, length_sigma = 5):
+def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d", window_size=160, stride=36, filter_window=20, smooth_heading=True, heading_sigma=5, smooth_length=False, length_sigma=5):
     mid = window_size // 2 - stride // 2
     if mode == "2d":
-        # [新增] 将IMU数据旋转到世界坐标系
+        # 将IMU数据旋转到世界坐标系
         acc_data, gyro_data = rotate_to_global(acc_data, gyro_data, ori_data)
 
         pos2d = pos_data[:, :2]
@@ -130,22 +130,12 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode = "2d", window_
         y_head_abs = []  # 绝对航向标签
         y_head_rel = []  # 相对航向标签
         
-        # 初始化
-        # [修改] 使用绝对航向而非相对航向变化
-        # 每个样本的标签是当前步的绝对位移方向
-
-        # init_pos 取第一个窗口的起点 (a)
+        # init_pos 取第一个窗口的起点
         idx_0 = 0
         a_0 = idx_0 + window_size // 2 - stride // 2
-        b_0 = idx_0 + window_size // 2 + stride // 2
-        # 确保索引安全
         a_0 = max(0, min(a_0, len(pos2d)-1))
-        b_0 = max(0, min(b_0, len(pos2d)-1))
-
         init_pos = pos2d[a_0, :]
-
-        # [修改] 对于绝对航向，我们不需要init_head，因为模型直接预测绝对航向
-        init_head = 0.0  # 设为0，不再使用
+        init_head = 0.0
 
         max_start = gyro_data.shape[0] - window_size - 1
         for i, idx in enumerate(range(0, max_start, stride)):
@@ -158,7 +148,6 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode = "2d", window_
             a = idx + window_size // 2 - stride // 2
             b = idx + window_size // 2 + stride // 2
             
-            # 索引边界保护
             a = max(0, min(a, len(pos2d)-1))
             b = max(0, min(b, len(pos2d)-1))
             
@@ -168,110 +157,93 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode = "2d", window_
             # 1. 步长 (弦长)
             delta_len = np.linalg.norm(pb - pa)
 
-            # 2. [修改] 绝对航向：当前步的位移方向
+            # 2. 绝对航向 (原始值)
             curr_diff = pb - pa
-            # 处理静止情况，防止 NaN
             if np.linalg.norm(curr_diff) < 1e-6:
-                abs_heading = 0.0  # 静止时设为0
+                abs_heading = 0.0
             else:
                 abs_heading = np.arctan2(curr_diff[1], curr_diff[0])
 
-            y_len .append(np.array([delta_len], dtype=np.float32))
+            y_len.append(np.array([delta_len], dtype=np.float32))
             y_head_abs.append(np.array([abs_heading], dtype=np.float32))
-            # 相对航向将在平滑处理后计算
 
         x_gyro = np.array(x_gyro)
         x_acc  = np.array(x_acc)
         y_len  = np.array(y_len)
         y_head_abs = np.array(y_head_abs)
 
-        # 在平滑之前进行数据清洗：基于步长判断静止状态
-        # 如果步长绝对值小于阈值，说明处于静止状态，将步长和航向角都设为0
+        # 静止检测与处理
         if len(y_len) > 0 and len(y_head_abs) > 0:
-            # 基于步长判断是否静止
-            stationary_mask = np.abs(y_len.flatten()) < 0.01  # 步长小于1cm认为静止
-
-            # 将静止状态的样本标签设为0
+            stationary_mask = np.abs(y_len.flatten()) < 0.01
             y_len[stationary_mask, 0] = 0.0
             y_head_abs[stationary_mask, 0] = 0.0
 
-        # 对步长进行平滑处理（提高真值轨迹的光滑性）
+        # 平滑步长
         if smooth_length and len(y_len) > 0:
             y_len_smooth = gaussian_filter1d(y_len.flatten(), sigma=length_sigma)
             y_len = y_len_smooth.reshape(-1, 1)
         
-        # 对绝对航向进行平滑处理，并计算相对航向
+        # === [核心修改] 绝对航向与相对航向平滑 ===
         if smooth_heading and len(y_head_abs) > 0:
             flat_head_abs = y_head_abs.flatten()
 
-            # 1. 解缠 (Unwrap): 消除 +/- pi 的跳变
+            # 1. 解缠 (Unwrap): 消除 +/- pi 的跳变，变成连续曲线
             unwrapped_head_abs = np.unwrap(flat_head_abs)
 
             # 2. 平滑 (Smooth): 在连续空间进行高斯滤波
+            # 这是关键步骤，它同时平滑了用于计算 Rel 的源数据，和平滑了 Abs 本身
             smoothed_unwrapped_abs = gaussian_filter1d(unwrapped_head_abs, sigma=heading_sigma)
 
-            # 3. 计算相对航向：在unwrap空间计算差分
-            # 注意：第一个元素没有前一个值，设为0
+            # 3. 计算相对航向 (从平滑后的连续曲线计算差分)
             rel_headings_unwrapped = np.zeros_like(smoothed_unwrapped_abs)
             rel_headings_unwrapped[1:] = np.diff(smoothed_unwrapped_abs)
-
-            # 4. 重缠绝对航向 (Rewrap): 变回 [-pi, pi] 范围
-            y_head_abs_smooth = wrap_angle(smoothed_unwrapped_abs)
-            y_head_abs = y_head_abs_smooth.reshape(-1, 1)
-
-            # 5. 相对航向保持在连续空间（无需rewrap，因为是差分）
             y_head_rel = rel_headings_unwrapped.reshape(-1, 1).astype(np.float32)
+
+            # 4. 重缠绝对航向 (Rewrap): 变回 [-pi, pi] 范围并赋值回 y_head_abs
+            y_head_abs_smooth = wrap_angle(smoothed_unwrapped_abs)
+            y_head_abs = y_head_abs_smooth.reshape(-1, 1)  # <--- 确保这一行存在！
+
         else:
-            # 如果不平滑，直接计算相对航向
+            # 不平滑时的处理
             y_head_rel = np.zeros((len(y_head_abs), 1), dtype=np.float32)
             if len(y_head_abs) > 1:
-                # 在unwrap空间计算差分
                 unwrapped_abs = np.unwrap(y_head_abs.flatten())
                 y_head_rel[1:, 0] = np.diff(unwrapped_abs)
 
         return [x_gyro, x_acc], [y_len, y_head_abs, y_head_rel], init_pos, init_head
 
     elif mode == "3d":
+        # 3D 模式代码保持不变...
         mid = window_size // 2 - stride // 2
         init_pos = pos_data[mid, :]
         init_euler = quaternion_to_euler(ori_data[mid, :])
-
         x_gyro = []
         x_acc = []
         y_delta_p = []
         y_delta_euler = []
-
         max_start = gyro_data.shape[0] - window_size - 1
         for idx in range(0, max_start, stride):
             xg = gyro_data[idx + 1: idx + 1 + window_size, :]
             xa = acc_data [idx + 1: idx + 1 + window_size, :]
-            
             x_gyro.append(xg)
             x_acc .append(xa)
-
             a = idx + window_size // 2 - stride // 2
             b = idx + window_size // 2 + stride // 2
-
             p_a = pos_data[a, :]
             p_b = pos_data[b, :]
             q_a = quaternion.from_float_array(ori_data[a, :])
             q_b = quaternion.from_float_array(ori_data[b, :])
-
             rotation_matrix = quaternion.as_rotation_matrix(q_a)
             delta_p = rotation_matrix.T @ (p_b - p_a)
-
             e_a = quaternion_to_euler(q_a)
             e_b = quaternion_to_euler(q_b)
             delta_euler = wrap_angle(e_b - e_a)
-
             y_delta_p.append(delta_p)
             y_delta_euler.append(delta_euler)
-
         x_gyro = np.reshape(x_gyro, (len(x_gyro), x_gyro[0].shape[0], x_gyro[0].shape[1]))
         x_acc = np.reshape(x_acc, (len(x_acc), x_acc[0].shape[0], x_acc[0].shape[1]))
         y_delta_p = np.reshape(y_delta_p, (len(y_delta_p), y_delta_p[0].shape[0]))
         y_delta_euler = np.reshape(y_delta_euler, (len(y_delta_euler), y_delta_euler[0].shape[0]))
-
         return [x_gyro, x_acc], [y_delta_p, y_delta_euler], init_pos, init_euler
 
     else:

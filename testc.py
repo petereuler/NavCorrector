@@ -39,11 +39,11 @@ window_size = 160
 stride = 32
 vis_num1 = 20000  # 当show_full_trajectory=False时，数据加载的最大长度限制
 vis_num2 = 500    # 当show_full_trajectory=False时，可视化的最大长度限制
-show_full_trajectory = False  # 设置为True时显示完整轨迹，忽略vis_num1和vis_num2限制
+show_full_trajectory = True  # 设置为True时显示完整轨迹，忽略vis_num1和vis_num2限制
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 batch_size = 256
-dataset = "OXIOD"
+dataset = "RONIN"
 
 # 航向角量化参数（必须与 trainc.py 一致）
 num_bits = 10  # 必须是 4 的倍数
@@ -88,25 +88,22 @@ def load_models(ckpt_dir, device):
     return models
 
 
-def predict_in_batches(models, gx, ax, batch_size=256, fusion_alpha=0.1):
-    """批量预测双流航向模型并进行互补滤波融合
-
-    Args:
-        models: 包含所有模型的字典
-        gx: 陀螺仪数据
-        ax: 加速度数据
-        batch_size: 批次大小
-        fusion_alpha: 互补滤波权重 (0-1)，控制绝对航向 vs 相对航向的比例
-
-    Returns:
-        pred_len: 预测步长
-        pred_head_fused: 融合后的航向 (使用互补滤波)
-        pred_head_abs: 绝对航向预测 (用于统计)
+def predict_in_batches(models, gx, ax, batch_size=256):
+    """
+    批量预测并进行动态卡尔曼滤波融合 (Uncertainty-based Kalman Filter)
+    
+    无需手动设置平滑权重。模型会输出每个预测值的方差(不确定性)，
+    卡尔曼滤波器会根据方差自动计算最优的卡尔曼增益 K。
+    - 当 Abs 不确定性大时（如磁场干扰），K 减小，信赖 Rel 积分。
+    - 当 Rel 不确定性大时（如快速旋转），K 增大，信赖 Abs 修正。
     """
     n = gx.shape[0]
     preds_len = []
     preds_head_fused = []
     preds_head_abs = []
+    preds_uncertainty = [] # [可选] 保存不确定性以便分析
+    
+    # 兼容旧接口的占位符
     preds_binary_probs = []
     preds_binary_hard = []
     preds_logits = []
@@ -115,8 +112,11 @@ def predict_in_batches(models, gx, ax, batch_size=256, fusion_alpha=0.1):
     models['reg_len'].eval()
     models['dual_heading'].eval()
 
-    # 初始化融合航向 (第一个时刻使用绝对航向预测)
-    fused_heading_prev = None
+    # === 卡尔曼滤波状态变量 ===
+    # state_x: 当前最优估计的航向 (Posterior Mean)
+    # state_p: 当前估计的协方差/不确定性 (Posterior Variance)
+    state_x = None
+    state_p = 0.0
 
     with torch.no_grad():
         for start in range(0, n, batch_size):
@@ -130,61 +130,97 @@ def predict_in_batches(models, gx, ax, batch_size=256, fusion_alpha=0.1):
             feat_l = models['extractor_len'](xb)
             pred_l = models['reg_len'](feat_l)
 
-            # === 2. 双流航向预测 ===
-            pred_abs, pred_rel = models['dual_heading'](xb)
+            # === 2. 双流航向预测 (带不确定性) ===
+            # 模型现在输出 4 个张量:
+            # mu: 预测均值, logvar: 对数方差 (log sigma^2)
+            p_abs_mu, p_abs_logvar, p_rel_mu, p_rel_logvar = models['dual_heading'](xb)
 
-            # === 3. 直接使用回归输出 ===
-            pred_h_abs_batch = pred_abs.cpu().numpy()  # 绝对航向直接输出
+            # === 3. 数据转换与方差恢复 ===
+            # 观测值 (Measurement) Z_k
+            meas_val_batch = p_abs_mu.cpu().numpy()
+            # 观测噪声协方差 R_k = exp(log_var)
+            meas_var_batch = np.exp(p_abs_logvar.cpu().numpy())
+            
+            # 控制量 (Control Input) u_k
+            ctrl_val_batch = p_rel_mu.cpu().numpy()
+            # 过程噪声协方差 Q_k = exp(log_var)
+            ctrl_var_batch = np.exp(p_rel_logvar.cpu().numpy())
 
-            # 为兼容性创建虚拟的二进制编码统计
-            pred_binary = np.zeros((pred_h_abs_batch.shape[0], num_bits))  # 虚拟二进制概率
-            pred_binary_hard_batch = np.zeros((pred_h_abs_batch.shape[0], num_bits), dtype=np.int32)  # 虚拟硬解码
+            # 准备结果容器
+            batch_current_size = meas_val_batch.shape[0]
+            fused_headings = np.zeros((batch_current_size, 1))
+            
+            # 兼容性占位符
+            pred_binary = np.zeros((batch_current_size, num_bits)) # 假设 num_bits 定义在全局
+            pred_binary_hard_batch = np.zeros((batch_current_size, num_bits), dtype=np.int32)
 
-            # === 4. 互补滤波融合 ===
-            batch_size_current = pred_h_abs_batch.shape[0]
+            # === 4. 动态卡尔曼滤波循环 ===
+            for i in range(batch_current_size):
+                # 获取当前步的参数
+                z_k = meas_val_batch[i, 0]      # 绝对航向观测值
+                R_k = meas_var_batch[i, 0]      # 绝对航向不确定性 (R)
+                
+                u_k = ctrl_val_batch[i, 0]      # 相对航向增量
+                Q_k = ctrl_var_batch[i, 0]      # 相对航向不确定性 (Q)
 
-            # 初始化融合航向数组
-            fused_headings = np.zeros_like(pred_h_abs_batch)
-
-            for i in range(batch_size_current):
-                # 当前批次中的绝对航向预测
-                abs_pred = pred_h_abs_batch[i, 0]
-
-                # 相对航向预测 (弧度)
-                rel_pred = pred_rel[i, 0].cpu().numpy()
-
-                if fused_heading_prev is None:
-                    # 第一个时刻：直接使用绝对航向
-                    fused_heading = abs_pred
+                if state_x is None:
+                    # 初始化：第一帧直接使用观测值，初始方差设为观测方差
+                    state_x = z_k
+                    state_p = R_k
                 else:
-                    # 互补滤波: H_final[t] = (1-α) * (H_final[t-1] + ΔH_pred[t]) + α * H_abs_pred[t]
-                    rel_integration = fused_heading_prev + rel_pred
-                    fused_heading = (1 - fusion_alpha) * rel_integration + fusion_alpha * abs_pred
+                    # --- A. 预测步 (Predict) ---
+                    # 1. 状态预测: X_pred = X_prev + u
+                    x_pred = state_x + u_k
+                    
+                    # 2. 协方差预测: P_pred = P_prev + Q
+                    p_pred = state_p + Q_k
 
-                fused_headings[i, 0] = fused_heading
-                fused_heading_prev = fused_heading
+                    # --- B. 更新步 (Update) ---
+                    # 3. 计算卡尔曼增益 K = P_pred / (P_pred + R)
+                    # K 动态决定了我们多信赖观测值 z_k
+                    # 如果 R_k 很大(Abs不准)，K 就会变小，状态主要由积分决定
+                    K = p_pred / (p_pred + R_k + 1e-8)
+
+                    # 4. 计算残差 (Innovation): y = z - X_pred
+                    # [关键] 必须处理角度周期性
+                    innovation = z_k - x_pred
+                    innovation = (innovation + np.pi) % (2 * np.pi) - np.pi
+
+                    # 5. 更新状态: X_new = X_pred + K * y
+                    state_x = x_pred + K * innovation
+                    
+                    # 6. 更新协方差: P_new = (1 - K) * P_pred
+                    state_p = (1 - K) * p_pred
+
+                # 保持状态在 [-pi, pi]
+                state_x = (state_x + np.pi) % (2 * np.pi) - np.pi
+                fused_headings[i, 0] = state_x
 
             # === 5. 收集结果 ===
             preds_len.append(pred_l.cpu().numpy())
             preds_head_fused.append(fused_headings)
-            preds_head_abs.append(pred_h_abs_batch.reshape(-1, 1))
+            preds_head_abs.append(meas_val_batch) # 记录 Abs 均值用于对比
+            
+            # 填充兼容性变量
             preds_binary_probs.append(pred_binary)
             preds_binary_hard.append(pred_binary_hard_batch)
-            preds_logits.append(pred_abs.cpu().numpy())  # 使用pred_abs而不是logits_abs
+            preds_logits.append(meas_val_batch) # 这里用 Abs 均值代替 Logits
 
             # 清理显存
-            del xb, feat_l, pred_l, pred_abs, pred_rel
+            del xb, feat_l, pred_l
+            del p_abs_mu, p_abs_logvar, p_rel_mu, p_rel_logvar
 
     # 合并所有批次的结果
     pred_len = np.concatenate(preds_len, axis=0)
     pred_head_fused = np.concatenate(preds_head_fused, axis=0)
     pred_head_abs = np.concatenate(preds_head_abs, axis=0)
+    
+    # 兼容旧接口的返回值
     pred_binary_probs = np.concatenate(preds_binary_probs, axis=0)
     pred_binary_hard = np.concatenate(preds_binary_hard, axis=0)
     pred_logits = np.concatenate(preds_logits, axis=0)
 
     return pred_len, pred_head_fused, pred_head_abs, pred_binary_probs, pred_binary_hard, pred_logits
-
 
 def main():
     project_dir = "/home/admin407/code/zyshe/NavCorrector"
@@ -323,9 +359,8 @@ def main():
             base_name = f"{parts[-3]}_{parts[-1].split('.')[0]}"
             
         # 预测（双流航向 + 互补滤波融合）
-        fusion_alpha = 0.1  # 互补滤波权重
         pred_len, pred_head_fused, pred_head_abs, pred_binary_probs, pred_binary_hard, pred_logits = predict_in_batches(
-            models, gx, ax, batch_size=batch_size, fusion_alpha=fusion_alpha
+            models, gx, ax, batch_size=batch_size
         )
 
         # 为了兼容性，将融合结果作为主要预测结果

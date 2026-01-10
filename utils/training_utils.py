@@ -75,7 +75,7 @@ def load_data_2d_oxiod(data_root, device, window_size=160, stride=32):
             stride=stride,
             filter_window=20,
             smooth_heading=True,  # 启用航向角平滑，提高真值轨迹光滑性
-            heading_sigma=1.5,    # 航向角高斯平滑标准差
+            heading_sigma=1.25,    # 航向角高斯平滑标准差
             smooth_length=False,   # 不平滑步长，只平滑航向
             length_sigma=1.0,    # 步长高斯平滑标准差
         )
@@ -153,7 +153,7 @@ def load_data_2d_selfmade(selfmade_root, device, window_size=160, stride=32):
             stride=stride,
             filter_window=10,
             smooth_heading=True,  # 启用航向角平滑，提高真值轨迹光滑性
-            heading_sigma=1.5,    # 航向角高斯平滑标准差
+            heading_sigma=1.25,    # 航向角高斯平滑标准差
             smooth_length=False,   # 不平滑步长，只平滑航向
             length_sigma=1.0,    # 步长高斯平滑标准差
         )
@@ -229,7 +229,7 @@ def load_data_2d_ronin(ronin_root, device, window_size=160, stride=32):
         [gx, ax], [dl, dh_abs, dh_rel], _, _ = ronin_window(
             gyro, acc, pos3d, ori, mode='2d', window_size=window_size, stride=stride, filter_window=20,
             smooth_heading=True,  # 启用航向角平滑，提高真值轨迹光滑性
-            heading_sigma=1.5,    # 航向角高斯平滑标准差
+            heading_sigma=1.25,    # 航向角高斯平滑标准差
             smooth_length=False,  # 不平滑步长，只平滑航向
             length_sigma=1.5,    # 步长高斯平滑标准差
         )

@@ -638,42 +638,41 @@ def compute_heading_mae(pred_heading, target_heading):
 
 class DualHeadingModel(torch.nn.Module):
     """
-    双流航向预测模型（使用regress.py中的回归结构）：
-    - 共享骨干网络 (RegFeatureExtractor - ResNet)
-    - 绝对航向头：RegHead (直接回归绝对航向)
-    - 相对航向头：RegHead (直接回归相对航向变化)
+    双流航向预测模型（支持不确定性估计）：
+    - 绝对航向头：输出 [预测值, log方差]
+    - 相对航向头：输出 [预测值, log方差]
     """
     def __init__(self, in_channels, feat_dim=64):
         super().__init__()
 
-        # 共享骨干网络 (使用regress.py中的ResNet结构)
+        # 共享骨干网络
         self.feature_extractor = RegFeatureExtractor(in_channels, feat_dim)
 
-        # 绝对航向头 (使用regress.py中的回归结构)
-        self.abs_head = RegHead(feat_dim, output_dim=1)
-
-        # 相对航向头 (使用regress.py中的回归结构)
-        self.rel_head = RegHead(feat_dim, output_dim=1)
+        # [修改] output_dim=2 (均值, log方差)
+        self.abs_head = RegHead(feat_dim, output_dim=2)
+        self.rel_head = RegHead(feat_dim, output_dim=2)
 
     def forward(self, x):
         """
-        Args:
-            x: 输入特征 (batch_size, seq_len, in_channels)
-
         Returns:
-            logits_abs: 绝对航向的二进制logits (batch_size, num_bits)
-            pred_rel: 相对航向的预测值 (batch_size, 1)
+            pred_abs_mu: 绝对航向预测值
+            pred_abs_logvar: 绝对航向不确定性 (log σ^2)
+            pred_rel_mu: 相对航向预测值
+            pred_rel_logvar: 相对航向不确定性 (log σ^2)
         """
-        # 提取特征
-        feat = self.feature_extractor(x)  # (batch_size, feat_dim)
+        feat = self.feature_extractor(x)
+        
+        # 绝对航向输出 (B, 2)
+        out_abs = self.abs_head(feat)
+        pred_abs_mu = out_abs[:, 0:1]
+        pred_abs_logvar = out_abs[:, 1:2]
+        
+        # 相对航向输出 (B, 2)
+        out_rel = self.rel_head(feat)
+        pred_rel_mu = out_rel[:, 0:1]
+        pred_rel_logvar = out_rel[:, 1:2]
 
-        # 绝对航向预测
-        logits_abs = self.abs_head(feat)  # (batch_size, num_bits)
-
-        # 相对航向预测
-        pred_rel = self.rel_head(feat)  # (batch_size, 1)
-
-        return logits_abs, pred_rel
+        return pred_abs_mu, pred_abs_logvar, pred_rel_mu, pred_rel_logvar
 
 
 class DualHeadingLoss(torch.nn.Module):
@@ -729,3 +728,61 @@ class DualHeadingLoss(torch.nn.Module):
         return total_loss, loss_dict
 
 
+class UncertaintyHeadingLoss(nn.Module):
+    """
+    [稳定版] 高斯负对数似然损失 (Gaussian NLL Loss + MSE Regularization)
+    
+    改进点：
+    1. 增加 mse_weight：强制模型回归均值，防止通过调大方差"作弊"。
+    2. 增加 log_var_clamp：限制方差范围，防止数值爆炸。
+    """
+    def __init__(self, rel_weight=10.0, mse_weight=1.0):
+        super().__init__()
+        self.rel_weight = rel_weight
+        self.mse_weight = mse_weight  # 新增：MSE 正则权重 (推荐 1.0)
+        
+        # 简单的 MSE 用于正则化
+        self.mse_loss = nn.MSELoss()
+
+    def gaussian_nll(self, pred, target, log_var, is_periodic=False):
+        # 1. 计算基础误差
+        diff = pred - target
+        if is_periodic:
+            # 周期性 Wrap
+            diff = torch.atan2(torch.sin(diff), torch.cos(diff))
+        
+        mse_term = diff ** 2
+        
+        # 2. [关键] 方差截断 (Clamping)
+        # min=-5 (sigma≈0.08) 防止除零/梯度爆炸
+        # max=5  (sigma≈12)  防止模型躺平(方差过大)
+        log_var = torch.clamp(log_var, min=-5.0, max=5.0)
+        
+        # 3. NLL Loss 计算
+        # Loss = 0.5 * exp(-s) * MSE + 0.5 * s
+        loss_nll = 0.5 * torch.exp(-log_var) * mse_term + 0.5 * log_var
+        
+        return loss_nll.mean(), mse_term.mean()
+
+    def forward(self, pred_abs_mu, pred_abs_logvar, pred_rel_mu, pred_rel_logvar, target_abs, target_rel):
+        # --- 绝对航向 (Abs) ---
+        loss_abs_nll, loss_abs_mse = self.gaussian_nll(
+            pred_abs_mu, target_abs, pred_abs_logvar, is_periodic=True
+        )
+        
+        # --- 相对航向 (Rel) ---
+        loss_rel_nll, loss_rel_mse = self.gaussian_nll(
+            pred_rel_mu, target_rel, pred_rel_logvar, is_periodic=False
+        )
+        
+        # --- 总 Loss 组合 ---
+        # 核心思想：同时优化 NLL (为了不确定性) 和 MSE (为了准度)
+        # 如果不加 MSE，模型初期容易迷失方向
+        loss_abs = loss_abs_nll + self.mse_weight * loss_abs_mse
+        loss_rel = loss_rel_nll + self.mse_weight * loss_rel_mse
+        
+        total_loss = loss_abs + self.rel_weight * loss_rel
+        
+        # 返回 total_loss 以及拆解项供打印
+        # 注意：这里返回的 loss_abs/loss_rel 已经是包含 MSE 正则的混合 Loss
+        return total_loss, loss_abs, loss_rel
