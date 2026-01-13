@@ -10,7 +10,6 @@ from data.dataset_SELFMADE import load_selfmade_raw, window_dataset as selfmade_
 from data.dataset_RONIN import load_ronin_raw, window_dataset as ronin_window
 from models.heading_classifier import (
     FeatureExtractor, RegressorHead,
-    HeadingQuantizer, HeadingBinaryHead,
     DualHeadingModel,
 )
 from src.util import generate_trajectory_2d
@@ -43,15 +42,7 @@ show_full_trajectory = True  # 设置为True时显示完整轨迹，忽略vis_nu
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 batch_size = 256
-dataset = "RONIN"
-
-# 航向角量化参数（必须与 trainc.py 一致）
-num_bits = 10  # 必须是 4 的倍数
-num_bins = 2 ** num_bits  # 4096 个 bin
-output_bits = num_bits
-encoding_mode = 'binary_code'
-
-
+dataset = "OXIOD"
 
 
 def load_models(ckpt_dir, device):

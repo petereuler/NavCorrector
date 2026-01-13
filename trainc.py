@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import quaternion
 
 from models.heading_classifier import (
-    HeadingQuantizer, DualHeadingModel, DualHeadingLoss, UncertaintyHeadingLoss,
+    DualHeadingModel, DualHeadingLoss, UncertaintyHeadingLoss,
     compute_heading_mae
 )
 from models.regress import FeatureExtractor as RegFeatureExtractor, RegressorHead as RegHead
@@ -44,13 +44,6 @@ batch_size = 64
 feat_dim = 64
 output_dim_len = 1
 
-# 航向角量化参数
-num_bits = 10  # 必须是 4 的倍数
-num_bins = 2 ** num_bits
-use_adaptive_quantization = False  # [修改] 绝对航向使用均匀量化，禁用自适应量化
-# 计算输出位数
-output_bits = num_bits
-
 # 优化器参数
 lr = 1e-4
 weight_decay = 1e-4
@@ -63,7 +56,7 @@ early_stop_patience = 50  # 仅在 adaptive 模式下生效
 # 数据增强
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
-dataset = "RONIN"
+dataset = "OXIOD"
 
 # 从环境变量读取
 epochs = int(os.getenv('EPOCHS', epochs))
