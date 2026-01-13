@@ -140,10 +140,6 @@ def predict_in_batches(models, gx, ax, batch_size=256):
             # 准备结果容器
             batch_current_size = meas_val_batch.shape[0]
             fused_headings = np.zeros((batch_current_size, 1))
-            
-            # 兼容性占位符
-            pred_binary = np.zeros((batch_current_size, num_bits)) # 假设 num_bits 定义在全局
-            pred_binary_hard_batch = np.zeros((batch_current_size, num_bits), dtype=np.int32)
 
             # === 4. 动态卡尔曼滤波循环 ===
             for i in range(batch_current_size):
@@ -192,9 +188,6 @@ def predict_in_batches(models, gx, ax, batch_size=256):
             preds_head_fused.append(fused_headings)
             preds_head_abs.append(meas_val_batch) # 记录 Abs 均值用于对比
             
-            # 填充兼容性变量
-            preds_binary_probs.append(pred_binary)
-            preds_binary_hard.append(pred_binary_hard_batch)
             preds_logits.append(meas_val_batch) # 这里用 Abs 均值代替 Logits
 
             # 清理显存
@@ -207,11 +200,9 @@ def predict_in_batches(models, gx, ax, batch_size=256):
     pred_head_abs = np.concatenate(preds_head_abs, axis=0)
     
     # 兼容旧接口的返回值
-    pred_binary_probs = np.concatenate(preds_binary_probs, axis=0)
-    pred_binary_hard = np.concatenate(preds_binary_hard, axis=0)
     pred_logits = np.concatenate(preds_logits, axis=0)
 
-    return pred_len, pred_head_fused, pred_head_abs, pred_binary_probs, pred_binary_hard, pred_logits
+    return pred_len, pred_head_fused, pred_head_abs, pred_logits
 
 def main():
     project_dir = "/home/admin407/code/zyshe/NavCorrector"
@@ -350,7 +341,7 @@ def main():
             base_name = f"{parts[-3]}_{parts[-1].split('.')[0]}"
             
         # 预测（双流航向 + 互补滤波融合）
-        pred_len, pred_head_fused, pred_head_abs, pred_binary_probs, pred_binary_hard, pred_logits = predict_in_batches(
+        pred_len, pred_head_fused, pred_head_abs, pred_logits = predict_in_batches(
             models, gx, ax, batch_size=batch_size
         )
 
