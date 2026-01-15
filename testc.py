@@ -1,590 +1,288 @@
 import os
+import time
 import torch
+import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
-from datetime import datetime
-import pandas as pd
+from torch.utils.data import TensorDataset, DataLoader
 
-from data.dataset_OXIOD import load_oxiod_raw, window_dataset as oxiod_window, yaw_from_quaternion_array, moving_average
-from data.dataset_SELFMADE import load_selfmade_raw, window_dataset as selfmade_window
+from models.end2end_pdr import EndToEndPDR
+from data.dataset_OXIOD import load_oxiod_raw, window_dataset as oxiod_window
 from data.dataset_RONIN import load_ronin_raw, window_dataset as ronin_window
-from models.heading_classifier import (
-    FeatureExtractor, RegressorHead,
-    DualHeadingModel,
-)
-from src.util import generate_trajectory_2d
-from src.pdr import PDR
-from utils.visualization import (
-    wrap_angle,
-    plot_trajectory_comparison,
-    plot_heading_analysis,
-    plot_time_series,
-    plot_cumulative_series,
-    plot_cumulative_error_series,
-    plot_error_histogram,
-    analyze_encoding_errors,
-    plot_trajectory_with_quiver,
-    plot_trajectory_turn_error_quiver
-)
-from utils.results import (
-    compute_path_length,
-    extract_ground_truth_positions,
-    save_results_to_csv
-)
+from data.dataset_SELFMADE import load_selfmade_raw, window_dataset as selfmade_window
 
+# ================= 配置参数 =================
+CONFIG = {
+    'window_size': 200,    # 必须与 trainc.py 一致
+    'stride': 10,          # 测试时可以密集一点，或者保持一致。用于轨迹积分时需注意匹配
+    'batch_size': 64,
+    'dataset': 'OXIOD',    # OXIOD, RONIN, SELFMADE
+    'data_root': '/home/admin407/code/zyshe/NavCorrector/OXIOD', # 修改为你的数据路径
+    'model_path': '/home/admin407/code/zyshe/NavCorrector/checkpoints/OXIOD_0115_1252/model_ep100.pth', # 【请修改】你的模型路径
+    'gpu_id': 0,
+    'test_file_idx': 0     # 在可视化环节，选择第几个验证文件进行画图
+}
 
-# ===== 参数配置（必须与 trainc.py 一致）=====
-window_size = 160
-stride = 32
-vis_num1 = 20000  # 当show_full_trajectory=False时，数据加载的最大长度限制
-vis_num2 = 500    # 当show_full_trajectory=False时，可视化的最大长度限制
-show_full_trajectory = True  # 设置为True时显示完整轨迹，忽略vis_num1和vis_num2限制
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
-batch_size = 256
-dataset = "OXIOD"
+device = torch.device(f"cuda:{CONFIG['gpu_id']}" if torch.cuda.is_available() else "cpu")
 
+# ================= 工具函数 =================
 
-def load_models(ckpt_dir, device):
-    """加载预训练的双流航向回归模型"""
-    input_dim = 6
-    feature_dim = 64
+def compute_errors(pred, gt):
+    """计算简单的平均绝对误差 (MAE)"""
+    return torch.mean(torch.abs(pred - gt)).item()
 
-    models = {
-        'extractor_len': FeatureExtractor(input_dim, feature_dim).to(device),
-        'reg_len': RegressorHead(feature_dim, 1).to(device),
-    }
-
-    # 双流航向模型 (直接回归)
-    models['dual_heading'] = DualHeadingModel(
-        in_channels=input_dim,
-        feat_dim=feature_dim
-    ).to(device)
-
-    model_files = {
-        'extractor_len': 'extractor_len.pth',
-        'reg_len': 'reg_len.pth',
-        'dual_heading': 'dual_heading_model.pth',
-    }
-
-    for model_name, filename in model_files.items():
-        model_path = os.path.join(ckpt_dir, filename)
-        if os.path.exists(model_path):
-            models[model_name].load_state_dict(torch.load(model_path, map_location=device))
-            models[model_name].eval()
-            print(f"已加载模型: {filename}")
-        else:
-            print(f"警告: 未找到模型文件 {filename}")
-
-    return models
-
-
-def predict_in_batches(models, gx, ax, batch_size=256):
+def angle_error(pred_vec, gt_vec):
     """
-    批量预测并进行动态卡尔曼滤波融合 (Uncertainty-based Kalman Filter)
-    
-    无需手动设置平滑权重。模型会输出每个预测值的方差(不确定性)，
-    卡尔曼滤波器会根据方差自动计算最优的卡尔曼增益 K。
-    - 当 Abs 不确定性大时（如磁场干扰），K 减小，信赖 Rel 积分。
-    - 当 Rel 不确定性大时（如快速旋转），K 增大，信赖 Abs 修正。
+    计算两个单位向量的角度误差 (rad)
+    pred_vec: (N, 2) [sin, cos]
+    gt_vec: (N, 2)
     """
-    n = gx.shape[0]
-    preds_len = []
-    preds_head_fused = []
-    preds_head_abs = []
-    preds_uncertainty = [] # [可选] 保存不确定性以便分析
+    # Dot product
+    dot = torch.sum(pred_vec * gt_vec, dim=1)
+    # Clamp for stability
+    dot = torch.clamp(dot, -1.0 + 1e-6, 1.0 - 1e-6)
+    return torch.mean(torch.acos(dot)).item()
+
+def align_trajectories(gt_traj, pred_traj):
+    """
+    使用 SVD 对齐两条轨迹 (用于去除全局坐标系偏差，公平对比形状)
+    gt_traj: (N, 2)
+    pred_traj: (N, 2)
+    """
+    # 1. 中心化
+    gt_center = np.mean(gt_traj, axis=0)
+    pred_center = np.mean(pred_traj, axis=0)
+    gt_centered = gt_traj - gt_center
+    pred_centered = pred_traj - pred_center
     
-    # 兼容旧接口的占位符
-    preds_binary_probs = []
-    preds_binary_hard = []
-    preds_logits = []
-
-    models['extractor_len'].eval()
-    models['reg_len'].eval()
-    models['dual_heading'].eval()
-
-    # === 卡尔曼滤波状态变量 ===
-    # state_x: 当前最优估计的航向 (Posterior Mean)
-    # state_p: 当前估计的协方差/不确定性 (Posterior Variance)
-    state_x = None
-    state_p = 0.0
-
-    with torch.no_grad():
-        for start in range(0, n, batch_size):
-            end = min(start + batch_size, n)
-
-            # 准备数据
-            xb = torch.tensor(np.concatenate([gx[start:end], ax[start:end]], axis=-1),
-                            dtype=torch.float32, device=device)
-
-            # === 1. 步长预测 ===
-            feat_l = models['extractor_len'](xb)
-            pred_l = models['reg_len'](feat_l)
-
-            # === 2. 双流航向预测 (带不确定性) ===
-            # 模型现在输出 4 个张量:
-            # mu: 预测均值, logvar: 对数方差 (log sigma^2)
-            p_abs_mu, p_abs_logvar, p_rel_mu, p_rel_logvar = models['dual_heading'](xb)
-
-            # === 3. 数据转换与方差恢复 ===
-            # 观测值 (Measurement) Z_k
-            meas_val_batch = p_abs_mu.cpu().numpy()
-            # 观测噪声协方差 R_k = exp(log_var)
-            meas_var_batch = np.exp(p_abs_logvar.cpu().numpy())
-            
-            # 控制量 (Control Input) u_k
-            ctrl_val_batch = p_rel_mu.cpu().numpy()
-            # 过程噪声协方差 Q_k = exp(log_var)
-            ctrl_var_batch = np.exp(p_rel_logvar.cpu().numpy())
-
-            # 准备结果容器
-            batch_current_size = meas_val_batch.shape[0]
-            fused_headings = np.zeros((batch_current_size, 1))
-
-            # === 4. 动态卡尔曼滤波循环 ===
-            for i in range(batch_current_size):
-                # 获取当前步的参数
-                z_k = meas_val_batch[i, 0]      # 绝对航向观测值
-                R_k = meas_var_batch[i, 0]      # 绝对航向不确定性 (R)
-                
-                u_k = ctrl_val_batch[i, 0]      # 相对航向增量
-                Q_k = ctrl_var_batch[i, 0]      # 相对航向不确定性 (Q)
-
-                if state_x is None:
-                    # 初始化：第一帧直接使用观测值，初始方差设为观测方差
-                    state_x = z_k
-                    state_p = R_k
-                else:
-                    # --- A. 预测步 (Predict) ---
-                    # 1. 状态预测: X_pred = X_prev + u
-                    x_pred = state_x + u_k
-                    
-                    # 2. 协方差预测: P_pred = P_prev + Q
-                    p_pred = state_p + Q_k
-
-                    # --- B. 更新步 (Update) ---
-                    # 3. 计算卡尔曼增益 K = P_pred / (P_pred + R)
-                    # K 动态决定了我们多信赖观测值 z_k
-                    # 如果 R_k 很大(Abs不准)，K 就会变小，状态主要由积分决定
-                    K = p_pred / (p_pred + R_k + 1e-8)
-
-                    # 4. 计算残差 (Innovation): y = z - X_pred
-                    # [关键] 必须处理角度周期性
-                    innovation = z_k - x_pred
-                    innovation = (innovation + np.pi) % (2 * np.pi) - np.pi
-
-                    # 5. 更新状态: X_new = X_pred + K * y
-                    state_x = x_pred + K * innovation
-                    
-                    # 6. 更新协方差: P_new = (1 - K) * P_pred
-                    state_p = (1 - K) * p_pred
-
-                # 保持状态在 [-pi, pi]
-                state_x = (state_x + np.pi) % (2 * np.pi) - np.pi
-                fused_headings[i, 0] = state_x
-
-            # === 5. 收集结果 ===
-            preds_len.append(pred_l.cpu().numpy())
-            preds_head_fused.append(fused_headings)
-            preds_head_abs.append(meas_val_batch) # 记录 Abs 均值用于对比
-            
-            preds_logits.append(meas_val_batch) # 这里用 Abs 均值代替 Logits
-
-            # 清理显存
-            del xb, feat_l, pred_l
-            del p_abs_mu, p_abs_logvar, p_rel_mu, p_rel_logvar
-
-    # 合并所有批次的结果
-    pred_len = np.concatenate(preds_len, axis=0)
-    pred_head_fused = np.concatenate(preds_head_fused, axis=0)
-    pred_head_abs = np.concatenate(preds_head_abs, axis=0)
+    # 2. 计算协方差矩阵 H
+    H = np.dot(pred_centered.T, gt_centered)
     
-    # 兼容旧接口的返回值
-    pred_logits = np.concatenate(preds_logits, axis=0)
+    # 3. SVD
+    U, S, Vt = np.linalg.svd(H)
+    R = np.dot(Vt.T, U.T)
+    
+    # 4. 旋转与平移预测轨迹
+    pred_aligned = np.dot(pred_centered, R.T) + gt_center
+    return pred_aligned
 
-    return pred_len, pred_head_fused, pred_head_abs, pred_logits
+# ================= 加载单条序列用于可视化 =================
 
-def main():
-    project_dir = "/home/admin407/code/zyshe/NavCorrector"
-    data_root = os.path.join(project_dir, "OXIOD")
-    selfmade_root = os.path.join(project_dir, "SELFMADE")
-    ronin_root = os.path.join(project_dir, "RONIN")
-    ckpt_dir = os.path.join(project_dir, f"checkpoints_cls_{dataset}")
-    output_dir = os.path.join(project_dir, f"output/testc_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-    os.makedirs(output_dir, exist_ok=True)
-
-    print("="*60)
-    print("双流航向回归测试（绝对航向 + 相对航向，直接回归）")
-    print("="*60)
-    print(f"  模型结构: DualHeadingModel (基于ResNet回归)")
-    print(f"  绝对航向: 直接回归 [-π, π]")
-    print(f"  相对航向: 直接回归 Δθ")
-    print(f"  融合方式: 互补滤波 (α=0.1)")
-    print("="*60)
-
-    # 加载模型
-    print("\n正在加载预训练双流模型...")
-    models = load_models(ckpt_dir, device)
-    print("模型加载完成！")
-
-    # 测试文件列表
-    if dataset == "SELFMADE" and os.path.isdir(selfmade_root):
-        imu_files = []
-        for r, d, fns in os.walk(selfmade_root):
-            for fn in fns:
-                if fn.lower().endswith('.csv') or fn.lower().endswith('.mat'):
-                    imu_files.append(os.path.join(r, fn))
-        imu_files = sorted(imu_files)
-        gt_files = [None] * len(imu_files)
-    elif dataset == "RONIN" and os.path.isdir(ronin_root):
-        list_seen = os.path.join(ronin_root, 'lists', 'list_test_seen.txt')
-        with open(list_seen) as f:
-            names = [s.strip() for s in f.readlines() if len(s) > 0 and s[0] != '#']
-        imu_files = [os.path.join(ronin_root, 'Data', 'seen_subjects_test_set', n) for n in names]
-        gt_files = [None] * len(imu_files)
-    else:
-        imu_files = [
-            os.path.join(data_root, 'handheld', 'data1', 'syn', 'imu2.csv'),
-            os.path.join(data_root, 'handheld', 'data1', 'syn', 'imu5.csv'),
-            os.path.join(data_root, 'handheld', 'data1', 'syn', 'imu6.csv'),
-            os.path.join(data_root, 'handheld', 'data3', 'syn', 'imu1.csv'),
-            os.path.join(data_root, 'handheld', 'data4', 'syn', 'imu1.csv'),
-            os.path.join(data_root, 'handheld', 'data4', 'syn', 'imu3.csv'),
-            os.path.join(data_root, 'handheld', 'data5', 'syn', 'imu3.csv'),
-            #os.path.join(data_root, 'handheld', 'data1', 'syn', 'imu1.csv'),
+def load_single_sequence(dataset_name, data_root, file_index=0):
+    """
+    加载验证集中的某一个原始文件，用于生成完整轨迹
+    """
+    if dataset_name == 'OXIOD':
+        # 这里硬编码了验证集列表，需与 training_utils 保持一致或读取配置
+        # 为演示简单，我们直接列出几个验证文件
+        val_files = [
+            os.path.join(data_root, 'handheld', 'data1', 'syn', 'imu4.csv'),
+            os.path.join(data_root, 'handheld', 'data2', 'syn', 'imu2.csv'),
+            os.path.join(data_root, 'handheld', 'data3', 'syn', 'imu4.csv'),
         ]
-        gt_files = [f.replace("imu", "vi") for f in imu_files]
-
-    # 统计信息
-    all_len_mae = []
-    all_head_mae = []
-    all_rmse = []
-
-    # 逐文件测试
-    for imu_file, gt_file in zip(imu_files, gt_files):
-        print(f"\n正在处理文件: {os.path.basename(imu_file)}")
+        gt_files = [f.replace("imu", "vi") for f in val_files]
+        if file_index >= len(val_files): file_index = 0
         
-        if dataset == "RONIN":
-            gyro, acc, pos3d, ori = load_ronin_raw(imu_file)
-        elif dataset == "SELFMADE":
-            gyro, acc, pos3d, ori = load_selfmade_raw(imu_file)
-        else:
-            gyro, acc, pos3d, ori = load_oxiod_raw(imu_file, gt_file)
-            
-        # 根据是否显示完整轨迹决定数据长度
-        if show_full_trajectory:
-            # 使用完整数据，不截断
-            pass  # 保持原始长度
-        else:
-            # 使用限制长度（传统方式）
-            gyro, acc, pos3d, ori = gyro[:vis_num1], acc[:vis_num1], pos3d[:vis_num1], ori[:vis_num1]
-        pos2d = pos3d[:, :2]
+        print(f"Loading Test Sequence: {val_files[file_index]}")
+        gyro, acc, pos, ori = load_oxiod_raw(val_files[file_index], gt_files[file_index])
         
-        if dataset == "SELFMADE" or dataset == "RONIN":
-            head = ori[:, 0]
-        else:
-            head = yaw_from_quaternion_array(ori)
-            
-        if dataset == "RONIN":
-            window_fn = ronin_window
-        elif dataset == "SELFMADE":
-            window_fn = selfmade_window
-        else:
-            window_fn = oxiod_window
-        
-        # 根据数据集设置 filter_window（与训练时保持一致）
-        if dataset == "RONIN":
-            filter_window = 20  # RONIN 数据集不使用位置平滑
-        elif dataset == "SELFMADE":
-            filter_window = 20  # SELFMADE 数据集使用位置平滑
-        else:
-            filter_window = 20  # OXIOD 数据集使用位置平滑
-        
-        # 先获取平滑前的真值（用于对比）
-        [gx_raw, ax_raw], [dl_raw, dh_abs_raw, dh_rel_raw], init_l_raw, init_h_raw = window_fn(
-            gyro, acc, pos3d, ori,
-            mode="2d",
-            window_size=window_size,
-            stride=stride,
-            filter_window=filter_window,
-            smooth_heading=False,  # 不平滑航向角
-            smooth_length=False,    # 不平滑步长
+        # 使用对应的 window 函数切分，stride 必须与训练时的物理位移定义一致
+        # 我们训练时 label 是 "stride 长度内的位移"，所以测试积分时也用这个 stride
+        # 注意：可视化时我们可以用小一点的 stride 让轨迹更密，但需要对 step 进行缩放吗？
+        # 不需要，因为 label 是 "pos[b] - pos[a]"，其中 b-a = stride。
+        # 如果改变 stride，模型的 step 预测值物理意义会变（因为它学的是 stride 长度的位移）。
+        # **关键**: 必须使用与训练相同的 stride 来切窗，才能直接累加 step 重建轨迹。
+        inputs, labels, init_pos, _ = oxiod_window(
+            gyro, acc, pos, ori, 
+            window_size=CONFIG['window_size'], 
+            stride=CONFIG['stride']
         )
+        return inputs, labels, init_pos, pos[:, :2] # 返回 GT 完整轨迹用于对比
 
-        # 再获取平滑后的真值（用于训练和评估）
-        [gx, ax], [dl, dh_abs, dh_rel], init_l, init_h = window_fn(
-            gyro, acc, pos3d, ori,
-            mode="2d",
-            window_size=window_size,
-            stride=stride,
-            filter_window=filter_window,
-            smooth_heading=True,  # 启用航向角平滑，用于显示平滑后的轨迹
-            heading_sigma=1.5,    # 航向角高斯平滑标准差
-            smooth_length=False,   # 不平滑步长，只平滑航向
-            length_sigma=1.0,    # 步长高斯平滑标准差
-        )
-
-        # 为兼容性，将绝对航向作为主要航向
-        dh_raw = dh_abs_raw
-        dh = dh_abs
+    elif dataset_name == 'RONIN':
+        # RONIN 验证集
+        seen_base = os.path.join(data_root, 'Data', 'seen_subjects_test_set')
+        val_dirs = sorted([os.path.join(seen_base, d) for d in os.listdir(seen_base) if os.path.isdir(os.path.join(seen_base, d))])
         
-        if gx.shape[0] == 0:
-            print("窗口长度不足，跳过该序列")
-            continue
+        if file_index >= len(val_dirs): file_index = 0
+        target_dir = val_dirs[file_index]
+        print(f"Loading Test Sequence: {target_dir}")
         
-        # 生成文件名前缀（提前定义，用于后续统计）
-        if dataset == "RONIN":
-            base_name = os.path.basename(imu_file)
-        else:
-            rel_path = os.path.relpath(imu_file, data_root)
-            parts = rel_path.split(os.sep)
-            base_name = f"{parts[-3]}_{parts[-1].split('.')[0]}"
-            
-        # 预测（双流航向 + 互补滤波融合）
-        pred_len, pred_head_fused, pred_head_abs, pred_logits = predict_in_batches(
-            models, gx, ax, batch_size=batch_size
+        gyro, acc, pos, ori = load_ronin_raw(target_dir)
+        inputs, labels, init_pos, _ = ronin_window(
+            gyro, acc, pos, ori, mode='2d',
+            window_size=CONFIG['window_size'], 
+            stride=CONFIG['stride']
         )
+        return inputs, labels, init_pos, pos[:, :2]
 
-        # 为了兼容性，将融合结果作为主要预测结果
-        pred_head_soft = pred_head_fused  # 用于轨迹重建的主要航向
-        pred_head_hard = pred_head_abs    # 用于统计的绝对航向
+    else:
+        # Selfmade
+        files = []
+        for r, d, fns in os.walk(data_root):
+            for fn in fns:
+                if fn.endswith('.csv'): files.append(os.path.join(r, fn))
+        files = sorted(files)
+        # 取最后 20%
+        split = max(1, int(0.2 * len(files)))
+        val_files = files[-split:]
+        
+        if file_index >= len(val_files): file_index = 0
+        target_file = val_files[file_index]
+        print(f"Loading Test Sequence: {target_file}")
+        
+        gyro, acc, pos, ori = load_selfmade_raw(target_file)
+        inputs, labels, init_pos, _ = selfmade_window(
+            gyro, acc, pos, ori, mode='2d',
+            window_size=CONFIG['window_size'], stride=CONFIG['stride']
+        )
+        return inputs, labels, init_pos, pos[:, :2]
+
+
+# ================= 主测试流程 =================
+
+def test():
+    # 1. 加载模型
+    print(f"Loading model from {CONFIG['model_path']} ...")
+    model = EndToEndPDR(in_dim=6).to(device)
     
-        # 对齐数据长度
-        min_len = min(len(dl), len(dh), len(pred_len), len(pred_head_soft), len(pred_head_hard))
-        dl = dl[:min_len]
-        dh = dh[:min_len]
-        pred_len = pred_len[:min_len]
-        pred_head_soft = pred_head_soft[:min_len]
-        pred_head_hard = pred_head_hard[:min_len]
+    if os.path.exists(CONFIG['model_path']):
+        checkpoint = torch.load(CONFIG['model_path'], map_location=device)
+        model.load_state_dict(checkpoint)
+        print("Model loaded successfully.")
+    else:
+        print("Error: Model file not found!")
+        return
 
-        # =======================================================
-        # 【新增修复】强制对齐初始帧
-        # 原因：消除第0步预测误差导致的整体轨迹旋转，确保对比公平
-        # =======================================================
-        if len(pred_head_soft) > 0:
-            print(f"  > 执行初始对齐: 修正前第0步误差 {np.degrees(pred_head_soft[0,0] - dh[0,0]):.4f} deg")
-            
-            # 1. 强制第0步的航向变化完全等于真值
-            # 这样在 heading_analysis.png 中，第0个点会完全重合
-            pred_head_soft[0] = dh[0]
-            
-            # (可选) 如果你也想让硬解码对齐，加上这行
-            pred_head_hard[0] = dh[0] 
+    model.eval()
 
-            # (可选) 甚至可以对齐前几帧（例如前0.5秒），让模型“热身”
-            # warmup_steps = 5
-            # pred_head_soft[:warmup_steps] = dh[:warmup_steps]
-        # =======================================================
-        
-        # 对齐平滑前的数据长度
-        if dl_raw is not None and dh_raw is not None and len(dl_raw) > 0 and len(dh_raw) > 0:
-            min_len_raw = min(len(dl_raw), len(dh_raw), min_len)
-            dl_raw = dl_raw[:min_len_raw]
-            dh_raw = dh_raw[:min_len_raw]
-        else:
-            dl_raw = None
-            dh_raw = None
-        
-        # 对于回归方法，跳过编码错误分析（回归方法没有编码概念）
-        print(f"  跳过编码错误分析（回归方法）")
-
-        # [修改] 生成轨迹（基于步长+绝对航向）
-        # 对于绝对航向，不再需要传入init_h（设为0即可）
-        traj_gt = generate_trajectory_2d(init_l, 0.0, dl, dh[:len(dl)])
-        traj_pred = generate_trajectory_2d(init_l, 0.0, pred_len, pred_head_soft[:len(pred_len)])
-        
-        # 生成平滑前的轨迹（用于对比）
-        traj_gt_raw = None
-        if dl_raw is not None and dh_raw is not None:
-            traj_gt_raw = generate_trajectory_2d(init_l_raw, 0.0, dl_raw, dh_raw[:len(dl_raw)])
-
-        # 计算 dataset_OXIOD 中使用的起始索引
-        start_frame_idx = window_size // 2 - stride // 2  # 例如 160//2 - 32//2 = 64
-
-        # 提取真值位置坐标
-        # 注意：不需要传入 init_l 了，而是传入索引，这样更精准
-        traj_gt_xy = extract_ground_truth_positions(
-            pos3d, 
-            window_size, 
-            stride, 
-            num_windows=len(dl), 
-            start_index=start_frame_idx  # <--- 关键参数
-)
-        
-        # 确保长度一致
-        min_len = min(len(traj_gt), len(traj_gt_xy), len(traj_pred))
-        traj_gt = traj_gt[:min_len]
-        traj_gt_xy = traj_gt_xy[:min_len]
-        traj_pred = traj_pred[:min_len]
-
-        # 传统PDR对比
-        pdr = PDR(initial_pos=init_l, initial_yaw=init_h)
-        init_pos, init_yaw, pdr_dl, pdr_dh = pdr.get_step_and_heading_deltas(gyro, acc)
-        traj_pdr = generate_trajectory_2d(init_pos, init_yaw, pdr_dl, pdr_dh[:len(pdr_dl)])
-        
-
-        # 截取可视化/评估数据
-        if show_full_trajectory:
-            # 使用完整轨迹进行评估
-            if traj_gt_raw is not None:
-                traj_len = min(len(traj_gt_raw), len(traj_pred))
-                gt_vis = traj_gt_raw[:traj_len]  # 使用平滑前的真值
-            else:
-                traj_len = min(len(traj_gt), len(traj_pred))
-                gt_vis = traj_gt[:traj_len]
-        else:
-            # 使用限制长度进行评估（传统方式）
-            if traj_gt_raw is not None:
-                traj_len = min(len(traj_gt_raw), len(traj_pred), vis_num2)
-                gt_vis = traj_gt_raw[:traj_len]  # 使用平滑前的真值
-            else:
-                traj_len = min(len(traj_gt), len(traj_pred), vis_num2)
-                gt_vis = traj_gt[:traj_len]
-        pred_vis = traj_pred[:traj_len]
-
-        # 计算评估指标（使用平滑前的真值）
-        error = np.linalg.norm(gt_vis - pred_vis, axis=1)
-        rmse = np.sqrt(np.mean((gt_vis - pred_vis) ** 2))
+    # 2. 定性分析：轨迹重建 (Trajectory Reconstruction)
+    # 加载一条完整的测试序列
+    # inputs: [x_gyro, x_acc] (List of numpy arrays)
+    # labels: [y_q, y_len, y_abs, y_rel]
+    (x_gyro, x_acc), labels, init_pos, gt_full_traj = load_single_sequence(
+        CONFIG['dataset'], CONFIG['data_root'], CONFIG['test_file_idx']
+    )
     
-        # 使用平滑前的真值计算MAE
-        dl_gt_for_error = dl_raw if dl_raw is not None else dl
-        dh_gt_for_error = dh_raw if dh_raw is not None else dh
+    # 转换为 Tensor batch
+    # Input shape: (N_windows, Window_Size, 6)
+    if len(x_gyro) == 0:
+        print("Sequence too short!")
+        return
 
-        if show_full_trajectory:
-            # 使用完整数据计算MAE
-            min_error_len = min(len(dl_gt_for_error), len(dh_gt_for_error), len(pred_len), len(pred_head_soft))
-        else:
-            # 使用限制长度计算MAE（传统方式）
-            min_error_len = min(len(dl_gt_for_error), len(dh_gt_for_error), len(pred_len), len(pred_head_soft), vis_num2)
-
-        len_mae = np.abs(pred_len[:min_error_len, 0] - dl_gt_for_error[:min_error_len, 0]).mean()
-        head_mae = np.abs(wrap_angle(pred_head_soft[:min_error_len, 0] - dh_gt_for_error[:min_error_len, 0])).mean()
+    # 拼接 Gyro, Acc
+    x_batch = np.concatenate([x_gyro, x_acc], axis=-1) # (N, T, 6)
+    # 如果 training_utils 里做了 permute (N,6,T)，这里也要保持一致
+    # 假设 dataset 输出的是 (N, T, 3)，拼接后是 (N, T, 6)。
+    # 检查 EndToEndPDR 输入要求：forward(x_raw) -> (B, T, 6)
+    # 所以不需要 transpose。
+    
+    x_tensor = torch.tensor(x_batch, dtype=torch.float32).to(device)
+    
+    print(f"Running inference on {len(x_tensor)} windows...")
+    
+    with torch.no_grad():
+        # 端到端推理
+        # Phase 3 模式：use_gt_rotation=False
+        outputs = model(x_tensor, use_gt_rotation=False)
         
-        gt_total_length = compute_path_length(gt_vis)
-   
-        # 打印评估结果
-        print(f"[{base_name}] RMSE: {rmse:.4f}m")
-        print(f"  Length MAE: {len_mae:.4f}m")
-        print(f"  Heading MAE: {np.degrees(head_mae):.2f} deg")
-        print(f"  Total path length: {gt_total_length:.2f}m")
+        # 提取预测值
+        pred_steps = outputs['step'].cpu().numpy().flatten() # (N,)
+        pred_abs_vec = outputs['abs_vec'].cpu().numpy()      # (N, 2)
+        pred_qs = outputs['q'].cpu().numpy()                 # (N, 4) 用于姿态分析
         
-        all_len_mae.append(len_mae)
-        all_head_mae.append(head_mae)
-        all_rmse.append(rmse)
-
-        # 根据是否显示完整轨迹来决定可视化长度
-        vis_len = len(dl) if show_full_trajectory else vis_num2
-        print(f"可视化长度: {vis_len} (显示完整轨迹: {show_full_trajectory})")
-
-        # 生成轨迹对比图（四个子图）
-        plot_trajectory_comparison(traj_gt, traj_gt_xy, traj_pred, output_dir, base_name,
-                                 traj_gt_raw=traj_gt_raw, traj_pdr=traj_pdr, vis_num=vis_len if show_full_trajectory else None)
-
-        # ==================== [修改] 新增：真值 vs 预测 双箭头矢量图 ====================
-
-        # 1. [修改] 准备预测值的绝对航向 (N,)
-        # 对于绝对航向，pred_head_soft已经是绝对航向，直接使用
-        vis_headings_pred = pred_head_soft[:len(pred_vis), 0]
-
-        # 2. [修改] 准备真值的绝对航向 (N,)
-        # 对于绝对航向，dh已经是绝对航向，直接使用
-        vis_headings_gt = dh[:len(pred_vis), 0]
+    # --- 轨迹积分 (Dead Reckoning) ---
+    # Pos_k = Pos_{k-1} + Step_k * Direction_k
+    # 初始位置设为 (0,0) 或 init_pos
+    pred_traj = [np.array([0.0, 0.0])]
+    curr_pos = np.array([0.0, 0.0])
+    
+    for i in range(len(pred_steps)):
+        step_len = pred_steps[i]
+        # pred_abs_vec 是 [sin, cos] -> dy, dx
+        sin_theta, cos_theta = pred_abs_vec[i]
         
-        # 3. 调用绘图
-        plot_trajectory_with_quiver(
-            positions=pred_vis, 
-            headings_gt=vis_headings_gt, 
-            headings_pred=vis_headings_pred,
-            step_interval=1,    # 采样间隔，保持不变
-            arrow_length=0.2,    # 箭头长度，稍微调小了一点
-            output_file=os.path.join(output_dir, f"{base_name}_quiver.png")
-        )
-        print(f"  矢量航向对比图保存至: {base_name}_quiver.png")
+        # dx = step * cos, dy = step * sin
+        dx = step_len * cos_theta
+        dy = step_len * sin_theta
         
-        # =========================================================================
-
-        # ==================== 新增：瞬时转向误差双箭头分析图 ====================
+        curr_pos = curr_pos + np.array([dx, dy])
+        pred_traj.append(curr_pos.copy())
         
-        # A. [修改] 准备基础数据 - 对于绝对航向
-        # 截取长度对齐 (N)
-        steps_len = len(pred_vis)
-        abs_h_pred = pred_head_soft[:steps_len, 0]  # 预测的绝对航向
-        abs_h_gt = dh[:steps_len, 0]                 # 真值的绝对航向
+    pred_traj = np.array(pred_traj)
+    
+    # --- GT 轨迹处理 ---
+    # GT 轨迹是原始的密集点，我们需要下采样或者取对应点来对比
+    # 或者直接画出原始 GT 轨迹（更准确）
+    # 但为了计算 ATE，需要对齐点数。
+    # 这里我们简单起见：画原始 GT 轨迹看形状，画预测轨迹看形状。
+    
+    # 对齐预测轨迹到 GT (SVD)
+    # 由于点数不匹配（GT 是 dense 的，Pred 是 sparse window based），
+    # 我们只对齐形状用于可视化。
+    # 为了严谨，应该从 GT 中提取对应的 segment points。
+    # dataset.py 里的 label 生成逻辑是：pb - pa。
+    # 我们可以用 cumsum(labels[y_len] * labels[y_abs]) 来重建 GT 的稀疏轨迹
+    
+    gt_steps = labels[1].flatten()
+    gt_headings = labels[2].flatten() # rad
+    gt_sparse_traj = [np.array([0.0, 0.0])]
+    curr_gt = np.array([0.0, 0.0])
+    for i in range(len(gt_steps)):
+        l = gt_steps[i]
+        h = gt_headings[i]
+        dx = l * np.cos(h)
+        dy = l * np.sin(h)
+        curr_gt = curr_gt + np.array([dx, dy])
+        gt_sparse_traj.append(curr_gt.copy())
+    gt_sparse_traj = np.array(gt_sparse_traj)
+    
+    # 现在 gt_sparse_traj 和 pred_traj 点数一一对应，可以对齐
+    pred_aligned = align_trajectories(gt_sparse_traj, pred_traj)
+    
+    # 计算 ATE (Absolute Trajectory Error)
+    ate = np.mean(np.linalg.norm(gt_sparse_traj - pred_aligned, axis=1))
+    print(f"Sequence ATE: {ate:.4f} m")
 
-        # B. [修改] 预测绝对航向 (Red Arrow Data)
-        vis_headings_pred = abs_h_pred
-
-        # C. [修改] 计算"局部真值"航向 (Purple Arrow Data)
-        # 对于绝对航向，我们直接使用真值的绝对航向作为局部真值
-        # 因为绝对航向没有累积误差问题
-        vis_headings_local_truth = abs_h_gt
-
-        # 计算瞬时转向误差（用于打印信息）
-        # 从绝对航向计算转向变化
-        if len(abs_h_pred) > 1:
-            turn_pred = np.diff(abs_h_pred)
-            turn_gt = np.diff(abs_h_gt)
-            turn_error = turn_gt - turn_pred
-        
-        # D. 调用绘图
-        plot_trajectory_turn_error_quiver(
-            positions=pred_vis,
-            headings_pred=vis_headings_pred,        # 红色：模型想往哪走
-            headings_local_truth=vis_headings_local_truth, # 紫色：模型该往哪走
-            step_interval=1,    
-            arrow_length=0.2,    # 稍微大一点以便观察分叉
-            output_file=os.path.join(output_dir, f"{base_name}_turn_error_quiver.png")
-        )
-        print(f"  瞬时转向误差分析图保存至: {base_name}_turn_error_quiver.png")
-        
-        # 打印最大突变点，方便在Log中快速定位
-        if len(abs_h_pred) > 1:
-            max_err_idx = np.argmax(np.abs(turn_error))
-            max_err_deg = np.degrees(np.abs(turn_error[max_err_idx]))
-            print(f"  > 最大单步转向误差: {max_err_deg:.2f}° (at step {max_err_idx})")
-        else:
-            print(f"  > 数据长度不足，无法计算转向误差")
-        
-        # ====================================================================
-
-        plot_heading_analysis(dh, pred_head_soft, pred_head_hard, vis_len,
-                             os.path.join(output_dir, f"{base_name}_heading_analysis.png"),
-                             dh_raw=dh_raw)
-
-        plot_time_series(dl, dh, pred_len, pred_head_soft, vis_len,
-                        os.path.join(output_dir, f"{base_name}_time_series.png"),
-                        dl_raw=dl_raw, dh_raw=dh_raw)
-
-        # plot_cumulative_series(dl, dh, pred_len, pred_head_soft, vis_num2, init_h,
-        #                        os.path.join(output_dir, f"{base_name}_cumulative_series.png"),
-        #                        dl_raw=dl_raw, dh_raw=dh_raw, init_h_raw=init_h_raw)
-
-        # plot_cumulative_error_series(dl, dh, pred_len, pred_head_soft, vis_num2, init_h,
-        #                              os.path.join(output_dir, f"{base_name}_cumulative_error.png"),
-        #                              dl_raw=dl_raw, dh_raw=dh_raw, init_h_raw=init_h_raw)
-
-        # plot_error_histogram(dl, dh, pred_len, pred_head_soft, vis_num2,
-        #                     os.path.join(output_dir, f"{base_name}_error_histogram.png"),
-        #                     quantizer, dl_raw=dl_raw, dh_raw=dh_raw)
-
-        # 保存数据到CSV文件
-        # save_results_to_csv(gt_vis, pred_vis, traj_pdr, dl, dh, pred_len, pred_head_soft,
-        #                    vis_num2, base_name, output_dir)
-
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
-
-    # 打印总体统计
-    print("\n" + "="*60)
-    print("总体统计:")
-    print(f"  平均 RMSE: {np.mean(all_rmse):.4f}m")
-    print(f"  平均 Length MAE: {np.mean(all_len_mae):.4f}m")
-    print(f"  平均 Heading MAE: {np.degrees(np.mean(all_head_mae)):.2f} deg")
-    print(f"  模型类型: 直接回归 (无量化)")
-    print("="*60)
-
-    print(f"\n测试完成！结果保存在: {output_dir}")
-
+    # --- 绘图 ---
+    plt.figure(figsize=(12, 6))
+    
+    # 1. 轨迹对比图
+    plt.subplot(1, 2, 1)
+    plt.plot(gt_sparse_traj[:, 0], gt_sparse_traj[:, 1], 'k-', label='Ground Truth (Sparse)', alpha=0.7)
+    plt.plot(pred_aligned[:, 0], pred_aligned[:, 1], 'r--', label='Prediction (Aligned)', linewidth=2)
+    plt.title(f"Trajectory Reconstruction (ATE: {ate:.2f}m)")
+    plt.xlabel("X (m)")
+    plt.ylabel("Y (m)")
+    plt.legend()
+    plt.axis('equal')
+    plt.grid(True)
+    
+    # 2. 航向/步长 分析
+    plt.subplot(2, 2, 2)
+    plt.plot(gt_steps, label='GT Step', alpha=0.6)
+    plt.plot(pred_steps, label='Pred Step', alpha=0.6)
+    plt.title("Step Length Estimation")
+    plt.legend()
+    plt.grid(True)
+    
+    plt.subplot(2, 2, 4)
+    # 计算 heading 角度用于显示
+    pred_yaw = np.arctan2(pred_abs_vec[:, 0], pred_abs_vec[:, 1])
+    gt_yaw = gt_headings
+    plt.plot(np.degrees(gt_yaw), label='GT Heading', alpha=0.6)
+    plt.plot(np.degrees(pred_yaw), label='Pred Heading', alpha=0.6)
+    plt.title("Absolute Heading Estimation (deg)")
+    plt.legend()
+    plt.grid(True)
+    
+    save_path = f"test_result_{CONFIG['dataset']}.png"
+    plt.tight_layout()
+    plt.savefig(save_path)
+    print(f"Visualization saved to {save_path}")
+    
+    # 3. 如果需要，可以把 PoseNet 的四元数误差也画出来
+    # (Optional) ...
 
 if __name__ == "__main__":
-    main()
+    test()
