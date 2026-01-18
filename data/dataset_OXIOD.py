@@ -44,6 +44,33 @@ def rotate_to_global(acc_data, gyro_data, ori_data):
 
     return np.array(acc_global), np.array(gyro_global)
 
+def rotate_to_global_by_gyro_integration(acc_data, gyro_data, fs=100.0):
+    """
+    通过三轴陀螺积分得到姿态，并旋转到近似全局系。
+    """
+    dt = 1.0 / float(fs)
+    acc_global = np.empty_like(acc_data)
+    gyro_global = np.empty_like(gyro_data)
+    q = quaternion.quaternion(1.0, 0.0, 0.0, 0.0)
+
+    for i in range(len(gyro_data)):
+        omega = gyro_data[i]
+        norm = np.linalg.norm(omega)
+        if norm < 1e-8:
+            dq = quaternion.quaternion(1.0, 0.0, 0.0, 0.0)
+        else:
+            axis = omega / norm
+            angle = norm * dt
+            half = 0.5 * angle
+            s = np.sin(half)
+            dq = quaternion.quaternion(np.cos(half), axis[0] * s, axis[1] * s, axis[2] * s)
+
+        q = q * dq
+        rot = quaternion.as_rotation_matrix(q)
+        acc_global[i] = rot @ acc_data[i]
+        gyro_global[i] = rot @ gyro_data[i]
+
+    return acc_global, gyro_global
 def moving_average(x, k):
     """简易滑动平均滤波，窗口 k>=1；k<=1 时原样返回。"""
     if k is None or k <= 1:
@@ -117,8 +144,8 @@ def load_oxiod_raw(imu_data_filename, gt_data_filename):
 def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d", window_size=160, stride=36, filter_window=20, smooth_heading=True, heading_sigma=5, smooth_length=False, length_sigma=5):
     mid = window_size // 2 - stride // 2
     if mode == "2d":
-        # 将IMU数据旋转到世界坐标系
-        acc_data, gyro_data = rotate_to_global(acc_data, gyro_data, ori_data)
+        # 将IMU数据旋转到世界坐标系（仅用陀螺积分，不使用真值姿态）
+        acc_data, gyro_data = rotate_to_global_by_gyro_integration(acc_data, gyro_data)
 
         pos2d = pos_data[:, :2]
         if filter_window and filter_window > 1:
@@ -248,3 +275,41 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d", window_si
 
     else:
         raise ValueError("mode must be '2d' or '3d'")
+
+
+def window_pose_dataset(gyro_data, acc_data, ori_data, window_size=160, stride=36, smooth_quat=True, quat_sigma=1.0):
+    """
+    构建用于相对姿态估计的窗口化数据集（目标为 stride 时间间隔内的四元数增量）。
+    """
+    x_gyro = []
+    x_acc = []
+    y_quat = []
+
+    max_start = gyro_data.shape[0] - window_size - 1
+    for idx in range(0, max_start, stride):
+        xg = gyro_data[idx + 1: idx + 1 + window_size, :]
+        xa = acc_data[idx + 1: idx + 1 + window_size, :]
+
+        a = idx + window_size // 2 - stride // 2
+        b = idx + window_size // 2 + stride // 2
+        a = max(0, min(a, len(ori_data) - 1))
+        b = max(0, min(b, len(ori_data) - 1))
+        q_a = quaternion.from_float_array(ori_data[a])
+        q_b = quaternion.from_float_array(ori_data[b])
+        q_delta = q_b * q_a.conj()
+
+        x_gyro.append(xg)
+        x_acc.append(xa)
+        y_quat.append(quaternion.as_float_array(q_delta).astype(np.float32))
+
+    x_gyro = np.array(x_gyro)
+    x_acc = np.array(x_acc)
+    y_quat = np.array(y_quat)
+
+    if smooth_quat and len(y_quat) > 1:
+        y_quat = gaussian_filter1d(y_quat, sigma=quat_sigma, axis=0)
+        norms = np.linalg.norm(y_quat, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-8)
+        y_quat = y_quat / norms
+
+    return [x_gyro, x_acc], y_quat

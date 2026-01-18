@@ -91,6 +91,15 @@ def load_ronin_raw(seq_path):
     return gyro, acc, pos3, yaw.reshape(-1, 1)
 
 
+def load_ronin_raw_pose(seq_path):
+    """加载 RONIN 原始数据（返回姿态四元数）"""
+    _, feat, _, ori, pos = _load_sequence(seq_path)
+    gyro = feat[:, :3]
+    acc = feat[:, 3:6]
+    pos3 = pos
+    return gyro, acc, pos3, ori
+
+
 def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d", window_size=200, stride=10, filter_window=10, smooth_heading=True, heading_sigma=1, smooth_length=False, length_sigma=1.0):
     """构建窗口化数据集 (修正静止航向问题)"""
     mid = window_size // 2 - stride // 2
@@ -196,7 +205,40 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d", window_si
 
         return [x_gyro, x_acc], [y_len, y_head_abs, y_head_rel], init_pos, init_head
 
-    elif mode == "3d":
-        raise ValueError("RONIN helper only provides 2d windows here")
-    else:
-        raise ValueError("mode must be '2d' or '3d'")
+
+def window_pose_dataset(gyro_data, acc_data, ori_data, window_size=200, stride=10, smooth_quat=True, quat_sigma=1.0):
+    """
+    构建用于相对姿态估计的窗口化数据集（目标为 stride 时间间隔内的四元数增量）。
+    """
+    x_gyro = []
+    x_acc = []
+    y_quat = []
+
+    max_start = gyro_data.shape[0] - window_size - 1
+    for idx in range(0, max_start, stride):
+        xg = gyro_data[idx + 1: idx + 1 + window_size, :]
+        xa = acc_data[idx + 1: idx + 1 + window_size, :]
+
+        a = idx + window_size // 2 - stride // 2
+        b = idx + window_size // 2 + stride // 2
+        a = max(0, min(a, len(ori_data) - 1))
+        b = max(0, min(b, len(ori_data) - 1))
+        q_a = quaternion.from_float_array(ori_data[a])
+        q_b = quaternion.from_float_array(ori_data[b])
+        q_delta = q_b * q_a.conj()
+
+        x_gyro.append(xg)
+        x_acc.append(xa)
+        y_quat.append(quaternion.as_float_array(q_delta).astype(np.float32))
+
+    x_gyro = np.array(x_gyro)
+    x_acc = np.array(x_acc)
+    y_quat = np.array(y_quat)
+
+    if smooth_quat and len(y_quat) > 1:
+        y_quat = gaussian_filter1d(y_quat, sigma=quat_sigma, axis=0)
+        norms = np.linalg.norm(y_quat, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-8)
+        y_quat = y_quat / norms
+
+    return [x_gyro, x_acc], y_quat

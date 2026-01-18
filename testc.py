@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import pandas as pd
 
-from data.dataset_OXIOD import load_oxiod_raw, window_dataset as oxiod_window, yaw_from_quaternion_array, moving_average
+from data.dataset_OXIOD import load_oxiod_raw, window_dataset as oxiod_window
 from data.dataset_SELFMADE import load_selfmade_raw, window_dataset as selfmade_window
 from data.dataset_RONIN import load_ronin_raw, window_dataset as ronin_window
 from models.heading_classifier import (
@@ -42,7 +42,21 @@ show_full_trajectory = True  # 设置为True时显示完整轨迹，忽略vis_nu
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 batch_size = 256
-dataset = "OXIOD"
+dataset = "RONIN"
+use_kf_fusion = False
+
+
+def _infer_reg_len_outdim(ckpt_path, default_dim=1):
+    if not os.path.exists(ckpt_path):
+        return default_dim
+    try:
+        state = torch.load(ckpt_path, map_location="cpu")
+        w = state.get("fc.4.weight")
+        if w is not None and hasattr(w, "shape") and len(w.shape) == 2:
+            return int(w.shape[0])
+    except Exception:
+        pass
+    return default_dim
 
 
 def load_models(ckpt_dir, device):
@@ -50,9 +64,11 @@ def load_models(ckpt_dir, device):
     input_dim = 6
     feature_dim = 64
 
+    reg_len_path = os.path.join(ckpt_dir, "reg_len.pth")
+    reg_len_dim = _infer_reg_len_outdim(reg_len_path, default_dim=1)
     models = {
         'extractor_len': FeatureExtractor(input_dim, feature_dim).to(device),
-        'reg_len': RegressorHead(feature_dim, 1).to(device),
+        'reg_len': RegressorHead(feature_dim, reg_len_dim).to(device),
     }
 
     # 双流航向模型 (直接回归)
@@ -120,6 +136,8 @@ def predict_in_batches(models, gx, ax, batch_size=256):
             # === 1. 步长预测 ===
             feat_l = models['extractor_len'](xb)
             pred_l = models['reg_len'](feat_l)
+            if pred_l.shape[-1] > 1:
+                pred_l = pred_l[:, :1]
 
             # === 2. 双流航向预测 (带不确定性) ===
             # 模型现在输出 4 个张量:
@@ -141,47 +159,50 @@ def predict_in_batches(models, gx, ax, batch_size=256):
             batch_current_size = meas_val_batch.shape[0]
             fused_headings = np.zeros((batch_current_size, 1))
 
-            # === 4. 动态卡尔曼滤波循环 ===
-            for i in range(batch_current_size):
-                # 获取当前步的参数
-                z_k = meas_val_batch[i, 0]      # 绝对航向观测值
-                R_k = meas_var_batch[i, 0]      # 绝对航向不确定性 (R)
-                
-                u_k = ctrl_val_batch[i, 0]      # 相对航向增量
-                Q_k = ctrl_var_batch[i, 0]      # 相对航向不确定性 (Q)
-
-                if state_x is None:
-                    # 初始化：第一帧直接使用观测值，初始方差设为观测方差
-                    state_x = z_k
-                    state_p = R_k
-                else:
-                    # --- A. 预测步 (Predict) ---
-                    # 1. 状态预测: X_pred = X_prev + u
-                    x_pred = state_x + u_k
+            if not use_kf_fusion:
+                fused_headings = meas_val_batch.copy()
+            else:
+                # === 4. 动态卡尔曼滤波循环 ===
+                for i in range(batch_current_size):
+                    # 获取当前步的参数
+                    z_k = meas_val_batch[i, 0]      # 绝对航向观测值
+                    R_k = meas_var_batch[i, 0]      # 绝对航向不确定性 (R)
                     
-                    # 2. 协方差预测: P_pred = P_prev + Q
-                    p_pred = state_p + Q_k
+                    u_k = ctrl_val_batch[i, 0]      # 相对航向增量
+                    Q_k = ctrl_var_batch[i, 0]      # 相对航向不确定性 (Q)
 
-                    # --- B. 更新步 (Update) ---
-                    # 3. 计算卡尔曼增益 K = P_pred / (P_pred + R)
-                    # K 动态决定了我们多信赖观测值 z_k
-                    # 如果 R_k 很大(Abs不准)，K 就会变小，状态主要由积分决定
-                    K = p_pred / (p_pred + R_k + 1e-8)
+                    if state_x is None:
+                        # 初始化：第一帧直接使用观测值，初始方差设为观测方差
+                        state_x = z_k
+                        state_p = R_k
+                    else:
+                        # --- A. 预测步 (Predict) ---
+                        # 1. 状态预测: X_pred = X_prev + u
+                        x_pred = state_x + u_k
+                        
+                        # 2. 协方差预测: P_pred = P_prev + Q
+                        p_pred = state_p + Q_k
 
-                    # 4. 计算残差 (Innovation): y = z - X_pred
-                    # [关键] 必须处理角度周期性
-                    innovation = z_k - x_pred
-                    innovation = (innovation + np.pi) % (2 * np.pi) - np.pi
+                        # --- B. 更新步 (Update) ---
+                        # 3. 计算卡尔曼增益 K = P_pred / (P_pred + R)
+                        # K 动态决定了我们多信赖观测值 z_k
+                        # 如果 R_k 很大(Abs不准)，K 就会变小，状态主要由积分决定
+                        K = p_pred / (p_pred + R_k + 1e-8)
 
-                    # 5. 更新状态: X_new = X_pred + K * y
-                    state_x = x_pred + K * innovation
-                    
-                    # 6. 更新协方差: P_new = (1 - K) * P_pred
-                    state_p = (1 - K) * p_pred
+                        # 4. 计算残差 (Innovation): y = z - X_pred
+                        # [关键] 必须处理角度周期性
+                        innovation = z_k - x_pred
+                        innovation = (innovation + np.pi) % (2 * np.pi) - np.pi
 
-                # 保持状态在 [-pi, pi]
-                state_x = (state_x + np.pi) % (2 * np.pi) - np.pi
-                fused_headings[i, 0] = state_x
+                        # 5. 更新状态: X_new = X_pred + K * y
+                        state_x = x_pred + K * innovation
+                        
+                        # 6. 更新协方差: P_new = (1 - K) * P_pred
+                        state_p = (1 - K) * p_pred
+
+                    # 保持状态在 [-pi, pi]
+                    state_x = (state_x + np.pi) % (2 * np.pi) - np.pi
+                    fused_headings[i, 0] = state_x
 
             # === 5. 收集结果 ===
             preds_len.append(pred_l.cpu().numpy())
@@ -214,12 +235,12 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
 
     print("="*60)
-    print("双流航向回归测试（绝对航向 + 相对航向，直接回归）")
+    print("绝对航向回归测试（仅绝对航向）")
     print("="*60)
     print(f"  模型结构: DualHeadingModel (基于ResNet回归)")
     print(f"  绝对航向: 直接回归 [-π, π]")
-    print(f"  相对航向: 直接回归 Δθ")
-    print(f"  融合方式: 互补滤波 (α=0.1)")
+    print(f"  相对航向: 关闭")
+    print(f"  融合方式: {'卡尔曼滤波' if use_kf_fusion else '关闭'}")
     print("="*60)
 
     # 加载模型
@@ -237,10 +258,10 @@ def main():
         imu_files = sorted(imu_files)
         gt_files = [None] * len(imu_files)
     elif dataset == "RONIN" and os.path.isdir(ronin_root):
-        list_seen = os.path.join(ronin_root, 'lists', 'list_test_seen.txt')
-        with open(list_seen) as f:
+        list_unseen = os.path.join(ronin_root, 'lists', 'list_test_unseen.txt')
+        with open(list_unseen) as f:
             names = [s.strip() for s in f.readlines() if len(s) > 0 and s[0] != '#']
-        imu_files = [os.path.join(ronin_root, 'Data', 'seen_subjects_test_set', n) for n in names]
+        imu_files = [os.path.join(ronin_root, 'Data', 'unseen_subjects_test_set', n) for n in names]
         gt_files = [None] * len(imu_files)
     else:
         imu_files = [
@@ -280,11 +301,6 @@ def main():
             gyro, acc, pos3d, ori = gyro[:vis_num1], acc[:vis_num1], pos3d[:vis_num1], ori[:vis_num1]
         pos2d = pos3d[:, :2]
         
-        if dataset == "SELFMADE" or dataset == "RONIN":
-            head = ori[:, 0]
-        else:
-            head = yaw_from_quaternion_array(ori)
-            
         if dataset == "RONIN":
             window_fn = ronin_window
         elif dataset == "SELFMADE":

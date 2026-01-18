@@ -47,7 +47,7 @@ output_dim_len = 1
 # 优化器参数
 lr = 1e-4
 weight_decay = 1e-4
-epochs = 500
+epochs = 100
 
 # 训练模式：'adaptive' (余弦退火+早停) 或 'fixed' (固定学习率+固定轮数)
 train_mode = 'fixed'  # 'adaptive' or 'fixed'
@@ -56,7 +56,7 @@ early_stop_patience = 50  # 仅在 adaptive 模式下生效
 # 数据增强
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
-dataset = "OXIOD"
+dataset = "RONIN"
 
 # 从环境变量读取
 epochs = int(os.getenv('EPOCHS', epochs))
@@ -80,10 +80,13 @@ def train_length_model(extractor, regressor, train_loader, val_loader, ckpt_dir,
     ckpts = [os.path.join(ckpt_dir, f) for f in ["extractor_len.pth", "reg_len.pth"]]
     
     if os.path.exists(ckpts[0]) and os.path.exists(ckpts[1]):
-        extractor.load_state_dict(torch.load(ckpts[0]))
-        regressor.load_state_dict(torch.load(ckpts[1]))
-        print("[Length] 发现已有最佳模型，跳过训练")
-        return
+        try:
+            extractor.load_state_dict(torch.load(ckpts[0]))
+            regressor.load_state_dict(torch.load(ckpts[1]))
+            print("[Length] 发现已有最佳模型，跳过训练")
+            return
+        except RuntimeError as exc:
+            print(f"[Length] 已有模型结构不匹配，重新训练: {exc}")
     
     best_loss = float('inf')
     train_curve = []
@@ -99,7 +102,11 @@ def train_length_model(extractor, regressor, train_loader, val_loader, ckpt_dir,
         total = 0.0
         cnt = 0
         
-        for xb, yb_len, _ , _ in train_loader:
+        for batch in train_loader:
+            if len(batch) == 4:
+                xb, yb_len, _, _ = batch
+            else:
+                xb, yb_len, _ = batch
             feat = extractor(xb)
             pred = regressor(feat)
             loss = len_loss(pred, yb_len)
@@ -125,7 +132,11 @@ def train_length_model(extractor, regressor, train_loader, val_loader, ckpt_dir,
         vtotal = 0.0
         vcnt = 0
         with torch.no_grad():
-            for xb, yb_len, _ , _ in val_loader:
+            for batch in val_loader:
+                if len(batch) == 4:
+                    xb, yb_len, _, _ = batch
+                else:
+                    xb, yb_len, _ = batch
                 feat = extractor(xb)
                 pred = regressor(feat)
                 loss = len_loss(pred, yb_len)
@@ -330,6 +341,100 @@ def train_dual_heading_model(model, train_loader, val_loader, ckpt_dir, curve_di
     # (此处代码与之前相同，绘制 val_fused_mae_curve 即可)
     print(f"\n最佳验证 KF-MAE: {np.degrees(best_fused_mae):.2f}°")
 
+
+def train_abs_heading_model(model, train_loader, val_loader, ckpt_dir, curve_dir):
+    """
+    训练绝对航向模型（仅 Abs，不使用 Rel）
+    """
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    if train_mode == 'fixed':
+        scheduler = None
+    else:
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2)
+
+    criterion = UncertaintyHeadingLoss(rel_weight=0.0).to(device)
+
+    ckpt_path = os.path.join(ckpt_dir, "dual_heading_model.pth")
+    if os.path.exists(ckpt_path):
+        print("[Abs Heading] 发现已有最佳模型，跳过训练")
+        return
+
+    best_mae = float('inf')
+    train_curve = []
+    val_mae_curve = []
+    abs_loss_curve = []
+
+    no_improve = 0
+    mode_str = "Fixed LR" if train_mode == 'fixed' else "Adaptive"
+    print(f">>> 开始训练绝对航向模型 (Uncertainty Learning, {mode_str})")
+
+    for ep in range(epochs):
+        t0 = time.time()
+
+        model.train()
+        total_loss = 0.0
+        total_abs_loss = 0.0
+        cnt = 0
+
+        for xb, _, yb_head_abs in train_loader:
+            p_abs_mu, p_abs_logvar, _, _ = model(xb)
+            loss_abs_nll, loss_abs_mse = criterion.gaussian_nll(
+                p_abs_mu, yb_head_abs, p_abs_logvar, is_periodic=True
+            )
+            loss = loss_abs_nll + criterion.mse_weight * loss_abs_mse
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            bs = xb.size(0)
+            total_loss += loss.item() * bs
+            total_abs_loss += loss.item() * bs
+            cnt += bs
+
+        if scheduler is not None:
+            scheduler.step()
+
+        avg_train_loss = total_loss / max(cnt, 1)
+        avg_abs_loss = total_abs_loss / max(cnt, 1)
+
+        model.eval()
+        val_mae_sum = 0.0
+        vcnt = 0
+        with torch.no_grad():
+            for xb, _, yb_head_abs in val_loader:
+                p_abs_mu, _, _, _ = model(xb)
+                val_mae_sum += compute_heading_mae(p_abs_mu, yb_head_abs).item() * xb.size(0)
+                vcnt += xb.size(0)
+
+        val_mae = val_mae_sum / max(vcnt, 1)
+        train_curve.append(avg_train_loss)
+        val_mae_curve.append(val_mae)
+        abs_loss_curve.append(avg_abs_loss)
+
+        is_best = ""
+        if val_mae < best_mae:
+            best_mae = val_mae
+            torch.save(model.state_dict(), ckpt_path)
+            no_improve = 0
+            is_best = "*"
+        else:
+            no_improve += 1
+
+        if train_mode == 'adaptive' and no_improve >= early_stop_patience:
+            print(f"  Early stopping at epoch {ep+1}")
+            break
+
+        if (ep + 1) % 5 == 0 or ep == 0:
+            print(f"[Ep {ep+1}] Loss:{avg_train_loss:.4f} "
+                  f"(Abs:{avg_abs_loss:.4f}) | "
+                  f"Val Abs-MAE: {np.degrees(val_mae):.2f}° {is_best} "
+                  f"time={time.time()-t0:.1f}s")
+
+    print(f"\n最佳验证 Abs-MAE: {np.degrees(best_mae):.2f}°")
+
 def main():
     project_dir = "/home/admin407/code/zyshe/NavCorrector"
     data_root = os.path.join(project_dir, "OXIOD")
@@ -342,12 +447,12 @@ def main():
     
 
     print("="*60)
-    print("双流航向回归训练（绝对航向 + 相对航向，直接回归）")
+    print("绝对航向回归训练（仅绝对航向）")
     print("="*60)
     print(f"  模型结构: DualHeadingModel (基于ResNet回归)")
     print(f"  绝对航向: 直接回归 [-π, π]")
-    print(f"  相对航向: 直接回归 Δθ")
-    print(f"  损失函数: MSELoss (Abs) + 10×MSELoss (Rel)")
+    print(f"  相对航向: 关闭")
+    print(f"  损失函数: MSELoss (Abs)")
     print(f"  训练模式: {train_mode} ({'固定学习率+固定轮数' if train_mode == 'fixed' else '余弦退火+早停'})")
     print(f"  学习率: {lr}, 权重衰减: {weight_decay}, 轮数: {epochs}")
     print("="*60)
@@ -366,15 +471,12 @@ def main():
     
     # 打印航向角分布
     head_abs_tr_np = yhead_abs_tr.cpu().numpy().flatten()
-    head_rel_tr_np = yhead_rel_tr.cpu().numpy().flatten()
     print(f"绝对航向范围: [{np.degrees(head_abs_tr_np.min()):.1f}°, {np.degrees(head_abs_tr_np.max()):.1f}°]")
     print(f"绝对航向标准差: {np.degrees(head_abs_tr_np.std()):.1f}°")
-    print(f"相对航向范围: [{np.degrees(head_rel_tr_np.min()):.1f}°, {np.degrees(head_rel_tr_np.max()):.1f}°]")
-    print(f"相对航向标准差: {np.degrees(head_rel_tr_np.std()):.1f}°")
 
     # 创建数据集 (双流航向标签)
-    train_dataset = TensorDataset(x_tr, ylen_tr, yhead_abs_tr, yhead_rel_tr)
-    val_dataset = TensorDataset(x_va, ylen_va, yhead_abs_va, yhead_rel_va)
+    train_dataset = TensorDataset(x_tr, ylen_tr, yhead_abs_tr)
+    val_dataset = TensorDataset(x_va, ylen_va, yhead_abs_va)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
 
@@ -385,7 +487,7 @@ def main():
     extractor_len = RegFeatureExtractor(in_channels=in_ch, feat_dim=feat_dim).to(device)
     reg_len = RegHead(feat_dim, output_dim_len).to(device)
     
-    # 双流航向模型 (绝对航向 + 相对航向，使用regress.py的结构)
+    # 绝对航向模型 (仅使用 abs head)
     dual_heading_model = DualHeadingModel(
         in_channels=in_ch,
         feat_dim=feat_dim
@@ -395,8 +497,8 @@ def main():
     print("\n🎯 训练步长模型")
     train_length_model(extractor_len, reg_len, train_loader, val_loader, ckpt_dir, curve_dir)
 
-    print("\n🎯 训练双流航向模型 (Abs + Rel, Direct Regression)")
-    train_dual_heading_model(dual_heading_model, train_loader, val_loader,
+    print("\n🎯 训练绝对航向模型 (Abs, Direct Regression)")
+    train_abs_heading_model(dual_heading_model, train_loader, val_loader,
                             ckpt_dir, curve_dir)
     
     print("\n✅ 训练完成")
