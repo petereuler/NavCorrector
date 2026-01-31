@@ -19,6 +19,6 @@
 # Allow core python files
 !trainc.py
 !testc.py
-
+!pretrain_encoder.py
 # Allow gitignore itself
 !.gitignore
