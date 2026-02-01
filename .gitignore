@@ -19,6 +19,11 @@
 # Allow core python files
 !trainc.py
 !testc.py
-!pretrain_encoder.py
+!embedding_train.py
+!eval_stage1.py
+!train_dist.py
+!train_pose.py
+!test_stage2.py
+!hybrid_embedding_train.py
 # Allow gitignore itself
 !.gitignore

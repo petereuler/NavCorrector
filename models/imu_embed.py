@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class IMUEncoderBase(nn.Module):
+class IMUEmbBase(nn.Module):
     """
     轻量级 1D CNN 编码器。
     输入: [B, 6, T]
@@ -49,19 +49,15 @@ class SupConHead(nn.Module):
         return self.mlp(x)
 
 
-class IMUEncoderNav(IMUEncoderBase):
-    """位移分支 IMU 编码器。"""
+class IMUEmbDist(IMUEmbBase):
+    """位移分支 IMU Embedding。"""
 
     def __init__(self, in_channels=6, feat_dim=128):
         super().__init__(in_channels=in_channels, feat_dim=feat_dim)
 
 
-class IMUEncoderPose(IMUEncoderBase):
-    """姿态分支 IMU 编码器。"""
+class IMUEmbPose(IMUEmbBase):
+    """姿态分支 IMU Embedding。"""
 
     def __init__(self, in_channels=6, feat_dim=128):
         super().__init__(in_channels=in_channels, feat_dim=feat_dim)
-
-
-# 兼容旧名称
-IMUEncoder = IMUEncoderBase

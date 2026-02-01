@@ -6,7 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 import torch.optim as optim
 
 from data.dataset_RIDI import load_ridi_raw, window_dataset as ridi_window
-from models.imu_encoder import IMUEncoderNav, IMUEncoderPose, SupConHead
+from models.imu_embed import IMUEmbDist, IMUEmbPose, SupConHead
 from utils.supcon_loss import PhysicsSupConLoss, PoseSupConLoss
 
 # ======= 显式配置区 =======
@@ -16,11 +16,11 @@ TRAIN_BRANCH = "nav"
 RIDI_ROOT = "/home/admin407/code/zyshe/NavCorrector/RIDI"
 ACC_SOURCE = "acce"  # "acce" 或 "linacce"
 WINDOW_SIZE = 256
-STRIDE = 256
+STRIDE = 128
 FEAT_DIM = 128
-SAMPLES_PER_EPOCH = 20000
+SAMPLES_PER_EPOCH = 40000
 BATCH_SIZE = 256
-EPOCHS = 500
+EPOCHS = 200
 LR = 1e-3
 TEMPERATURE = 0.07
 TH_LEN = 0.25
@@ -80,33 +80,23 @@ class RandomWindowDataset(Dataset):
 
     def __init__(self, sequences, window_size=256, stride=256, samples_per_epoch=20000):
         self.samples_per_epoch = samples_per_epoch
+        self.window_size = window_size
+        self.stride = stride
         self.data = []
-
         for gyro, acc, pos, ori in sequences:
-            [xg, xa], [_ylen, _yhead, _yabs, yori, yrel, ydp], _, _ = ridi_window(
-                gyro,
-                acc,
-                pos,
-                ori,
-                mode="2d",
-                window_size=window_size,
-                stride=stride,
-                filter_window=0,
-                smooth_heading=False,
-                smooth_length=False,
-                return_abs_heading=True,
-                return_ori=True,
-                return_rel_ori=True,
-                return_delta_p=True,
-                abs_heading_from_ori=False,
-                align_heading_to_init_pose=False,
-            )
-            if xg.shape[0] == 0:
+            n = min(len(gyro), len(acc), len(pos), len(ori))
+            if n < window_size + stride:
                 continue
-            self.data.append((xg, xa, yori, yrel, ydp))
-
+            self.data.append(
+                (
+                    gyro[:n].astype(np.float32),
+                    acc[:n].astype(np.float32),
+                    pos[:n].astype(np.float32),
+                    ori[:n].astype(np.float32),
+                )
+            )
         if len(self.data) == 0:
-            raise RuntimeError("No valid windows found in sequences.")
+            raise RuntimeError("No valid sequences for random sampling.")
 
     def __len__(self):
         return self.samples_per_epoch
@@ -114,31 +104,44 @@ class RandomWindowDataset(Dataset):
     def __getitem__(self, idx):
         _ = idx
         seq_idx = random.randint(0, len(self.data) - 1)
-        xg, xa, yori, yrel, ydp = self.data[seq_idx]
-        win_idx = random.randint(0, xg.shape[0] - 1)
+        gyro, acc, pos, ori = self.data[seq_idx]
+        max_start = len(gyro) - self.window_size - 1
+        if max_start <= 0:
+            start = 0
+        else:
+            start = random.randint(0, max_start)
+        end = start + self.window_size
 
-        gyro_win = xg[win_idx]
-        acc_win = xa[win_idx]
+        # window: [start, start+window)
+        gyro_win = gyro[start:end]
+        acc_win = acc[start:end]
         imu = np.concatenate([gyro_win, acc_win], axis=1).astype(np.float32)
-        imu = torch.from_numpy(imu).transpose(0, 1)  # [6, T]
+        imu = torch.from_numpy(imu).transpose(0, 1)  # [6, W]
 
-        # 导航真值：先把世界位移旋到手机坐标系
-        dp_world = ydp[win_idx]
-        q_abs = yori[win_idx]
+        # 保持与 stride 关系一致：以窗口中心为参考，a/b 相差 stride
+        a = start + self.window_size // 2 - self.stride // 2
+        b = start + self.window_size // 2 + self.stride // 2
+        a = max(0, min(a, len(pos) - 1))
+        b = max(0, min(b, len(pos) - 1))
+
+        # 导航真值：世界位移旋到手机坐标系
+        dp_world = pos[b] - pos[a]
+        q_abs = ori[b]
         R_abs = quat_to_rotmat(q_abs)
         dp_body = (R_abs.T @ dp_world.reshape(3, 1)).reshape(-1)
 
         # 物理真值向量 (len, cos, sin, dz)
         len_xy = np.linalg.norm(dp_body[:2]).astype(np.float32)
         dz = dp_body[2].astype(np.float32)
-
-        # 航向由位移方向给出（与姿态无关）
         yaw = np.arctan2(dp_body[1], dp_body[0]).astype(np.float32)
         cos_val = np.cos(yaw).astype(np.float32)
         sin_val = np.sin(yaw).astype(np.float32)
-
         gt_phy = torch.tensor([len_xy, cos_val, sin_val, dz], dtype=torch.float32)
-        q_rel = yrel[win_idx]
+
+        # 相对姿态 q_rel = qa^-1 * qb
+        qa = ori[a]
+        qb = ori[b]
+        q_rel = quat_mul(quat_conj(qa), qb)
         q_rel = torch.from_numpy(q_rel.astype(np.float32))
         return imu, gt_phy, q_rel
 
@@ -179,7 +182,7 @@ def train():
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
 
     if TRAIN_BRANCH == "nav":
-        encoder = IMUEncoderNav(in_channels=6, feat_dim=FEAT_DIM).to(device)
+        emb = IMUEmbDist(in_channels=6, feat_dim=FEAT_DIM).to(device)
         head = SupConHead(feat_dim=FEAT_DIM).to(device)
         criterion = PhysicsSupConLoss(
             temperature=TEMPERATURE,
@@ -187,27 +190,24 @@ def train():
             th_angle_cos=TH_ANGLE_COS,
             th_dz=TH_DZ,
         ).to(device)
-        ckpt_path = os.path.join(CKPT_DIR, "encoder_nav_best.pth")
+        ckpt_path = os.path.join(CKPT_DIR, "embed_dist_best.pth")
     elif TRAIN_BRANCH == "pose":
-        encoder = IMUEncoderPose(in_channels=6, feat_dim=FEAT_DIM).to(device)
+        emb = IMUEmbPose(in_channels=6, feat_dim=FEAT_DIM).to(device)
         head = SupConHead(feat_dim=FEAT_DIM).to(device)
         criterion = PoseSupConLoss(
             temperature=TEMPERATURE,
             angle_th=POSE_ANGLE_TH,
         ).to(device)
-        ckpt_path = os.path.join(CKPT_DIR, "encoder_pose_best.pth")
+        ckpt_path = os.path.join(CKPT_DIR, "embed_pose_best.pth")
     else:
         raise ValueError(f"Unknown TRAIN_BRANCH: {TRAIN_BRANCH}")
 
-    optimizer = optim.AdamW(
-        list(encoder.parameters()) + list(head.parameters()),
-        lr=LR,
-    )
+    optimizer = optim.AdamW(list(emb.parameters()) + list(head.parameters()), lr=LR)
 
     best_loss = float("inf")
     os.makedirs(CKPT_DIR, exist_ok=True)
     for ep in range(EPOCHS):
-        encoder.train()
+        emb.train()
         head.train()
         total_loss = 0.0
         total_count = 0
@@ -217,7 +217,7 @@ def train():
             gt_phy = gt_phy.to(device)
             q_rel = q_rel.to(device)
 
-            feat = encoder(imu)
+            feat = emb(imu)
             proj = head(feat)
             if TRAIN_BRANCH == "nav":
                 loss = criterion(proj, gt_phy)
@@ -226,10 +226,7 @@ def train():
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(encoder.parameters()) + list(head.parameters()),
-                1.0,
-            )
+            torch.nn.utils.clip_grad_norm_(list(emb.parameters()) + list(head.parameters()), 1.0)
             optimizer.step()
 
             bs = imu.size(0)
@@ -241,7 +238,7 @@ def train():
 
         if avg_loss < best_loss:
             best_loss = avg_loss
-            torch.save(encoder.state_dict(), ckpt_path)
+            torch.save(emb.state_dict(), ckpt_path)
 
     print(f"Best encoder saved to: {ckpt_path}")
 

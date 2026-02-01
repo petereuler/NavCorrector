@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 class PhysicsSupConLoss(nn.Module):
     """
-    基于 4D 物理向量 (len, cos, sin, dz) 的监督对比损失。
+    基于 4D 物理向量 (len, cos, sin, dz) 的监督对比损失（严格二值 mask）。
     """
 
     def __init__(self, temperature=0.07, th_len=0.1, th_angle_cos=0.99, th_dz=0.05):
