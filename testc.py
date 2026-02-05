@@ -5,12 +5,12 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import pandas as pd
 
-from data.dataset_OXIOD import load_oxiod_raw, window_dataset as oxiod_window, yaw_from_quaternion_array, moving_average
+from data.dataset_OXIOD import load_oxiod_raw, window_dataset as oxiod_window
 from data.dataset_SELFMADE import load_selfmade_raw, window_dataset as selfmade_window
 from data.dataset_RONIN import load_ronin_raw, window_dataset as ronin_window
 from models.heading_classifier import (
     FeatureExtractor, RegressorHead,
-    HeadingQuantizer, HeadingBinaryHead,
+    DualHeadingModel,
 )
 from src.util import generate_trajectory_2d
 from src.pdr import PDR
@@ -43,49 +43,46 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 batch_size = 256
 dataset = "RONIN"
-
-# 航向角量化参数（必须与 trainc.py 一致）
-num_bits = 8  # 必须是 4 的倍数
-num_bins = 2 ** num_bits  # 4096 个 bin
-output_bits = num_bits
-encoding_mode = 'binary_code'
+use_kf_fusion = False
 
 
+def _infer_reg_len_outdim(ckpt_path, default_dim=1):
+    if not os.path.exists(ckpt_path):
+        return default_dim
+    try:
+        state = torch.load(ckpt_path, map_location="cpu")
+        w = state.get("fc.4.weight")
+        if w is not None and hasattr(w, "shape") and len(w.shape) == 2:
+            return int(w.shape[0])
+    except Exception:
+        pass
+    return default_dim
 
 
 def load_models(ckpt_dir, device):
-    """加载预训练的模型和量化器"""
+    """加载预训练的双流航向回归模型"""
     input_dim = 6
     feature_dim = 64
-    
-    # 加载量化器（关键：必须使用训练时保存的量化器）
-    quantizer_path = os.path.join(ckpt_dir, "quantizer.json")
-    if os.path.exists(quantizer_path):
-        quantizer = HeadingQuantizer(num_bins=num_bins, use_gray_code=True, )
-        quantizer.load(quantizer_path)
-    else:
-        print(f"警告: 未找到量化器文件 {quantizer_path}，使用均匀量化")
-        quantizer = HeadingQuantizer(num_bins=num_bins, use_gray_code=True, )
-        # 手动设置均匀量化的边界
-        quantizer.bin_edges = np.linspace(-np.pi, np.pi, num_bins + 1)
-        quantizer.bin_centers = (quantizer.bin_edges[:-1] + quantizer.bin_edges[1:]) / 2
-        quantizer.fitted = True
-    
+
+    reg_len_path = os.path.join(ckpt_dir, "reg_len.pth")
+    reg_len_dim = _infer_reg_len_outdim(reg_len_path, default_dim=1)
     models = {
         'extractor_len': FeatureExtractor(input_dim, feature_dim).to(device),
-        'extractor_head': FeatureExtractor(input_dim, feature_dim).to(device),
-        'reg_len': RegressorHead(feature_dim, 1).to(device),
+        'reg_len': RegressorHead(feature_dim, reg_len_dim).to(device),
     }
-    
-    # 使用改进的二进制分类头
-    models['head'] = HeadingBinaryHead(feature_dim, num_bits=output_bits, hidden_dim=256, dropout=0.3).to(device)
+
+    # 双流航向模型 (直接回归)
+    models['dual_heading'] = DualHeadingModel(
+        in_channels=input_dim,
+        feat_dim=feature_dim
+    ).to(device)
+
     model_files = {
         'extractor_len': 'extractor_len.pth',
-        'extractor_head': 'extractor_head_cls.pth',
         'reg_len': 'reg_len.pth',
-        'head': 'cls_head.pth',
+        'dual_heading': 'dual_heading_model.pth',
     }
-    
+
     for model_name, filename in model_files.items():
         model_path = os.path.join(ckpt_dir, filename)
         if os.path.exists(model_path):
@@ -94,116 +91,162 @@ def load_models(ckpt_dir, device):
             print(f"已加载模型: {filename}")
         else:
             print(f"警告: 未找到模型文件 {filename}")
-    
-    return models, quantizer
+
+    return models
 
 
-def predict_in_batches(models, quantizer, gx, ax, batch_size=256, temperature=1.0, return_binary=False):
-    """批量预测 (集成 Soft Decoding)
+def predict_in_batches(models, gx, ax, batch_size=256):
+    """
+    批量预测并进行动态卡尔曼滤波融合 (Uncertainty-based Kalman Filter)
     
-    Args:
-        return_binary: 是否返回二进制编码（用于统计）
-    Returns:
-        pred_len, pred_head_soft, pred_head_hard, (pred_binary_probs, pred_binary_hard, logits_h)
+    无需手动设置平滑权重。模型会输出每个预测值的方差(不确定性)，
+    卡尔曼滤波器会根据方差自动计算最优的卡尔曼增益 K。
+    - 当 Abs 不确定性大时（如磁场干扰），K 减小，信赖 Rel 积分。
+    - 当 Rel 不确定性大时（如快速旋转），K 增大，信赖 Abs 修正。
     """
     n = gx.shape[0]
     preds_len = []
-    preds_head_soft = []
-    preds_head_hard = []
+    preds_head_fused = []
+    preds_head_abs = []
+    preds_uncertainty = [] # [可选] 保存不确定性以便分析
+    
+    # 兼容旧接口的占位符
     preds_binary_probs = []
     preds_binary_hard = []
     preds_logits = []
 
     models['extractor_len'].eval()
     models['reg_len'].eval()
-    models['extractor_head'].eval()
-    models['head'].eval()
-    
+    models['dual_heading'].eval()
+
+    # === 卡尔曼滤波状态变量 ===
+    # state_x: 当前最优估计的航向 (Posterior Mean)
+    # state_p: 当前估计的协方差/不确定性 (Posterior Variance)
+    state_x = None
+    state_p = 0.0
+
     with torch.no_grad():
         for start in range(0, n, batch_size):
             end = min(start + batch_size, n)
 
             # 准备数据
-            xb = torch.tensor(np.concatenate([gx[start:end], ax[start:end]], axis=-1), 
+            xb = torch.tensor(np.concatenate([gx[start:end], ax[start:end]], axis=-1),
                             dtype=torch.float32, device=device)
-            
+
             # === 1. 步长预测 ===
             feat_l = models['extractor_len'](xb)
             pred_l = models['reg_len'](feat_l)
-            
-            # === 2. 航向预测 ===
-            feat_h = models['extractor_head'](xb)
-            logits_h = models['head'](feat_h)
-            
-            # === 3. 关键修改：区分硬解码和软解码 ===
+            if pred_l.shape[-1] > 1:
+                pred_l = pred_l[:, :1]
 
-            # A. 硬解码 (Hard Decode) - 用于统计 Bit 错误率
-            probs = torch.sigmoid(logits_h)
-            pred_binary = probs.cpu().numpy()
-            pred_binary_hard_batch = (pred_binary > 0.5).astype(np.int32)
+            # === 2. 双流航向预测 (带不确定性) ===
+            # 模型现在输出 4 个张量:
+            # mu: 预测均值, logvar: 对数方差 (log sigma^2)
+            p_abs_mu, p_abs_logvar, p_rel_mu, p_rel_logvar = models['dual_heading'](xb)
+
+            # === 3. 数据转换与方差恢复 ===
+            # 观测值 (Measurement) Z_k
+            meas_val_batch = p_abs_mu.cpu().numpy()
+            # 观测噪声协方差 R_k = exp(log_var)
+            meas_var_batch = np.exp(p_abs_logvar.cpu().numpy())
             
-            # 使用 quantizer 的硬解码方法 (返回 Bin 中心)
-            pred_h_hard_batch = quantizer.decode_from_binary_vector(pred_binary)
+            # 控制量 (Control Input) u_k
+            ctrl_val_batch = p_rel_mu.cpu().numpy()
+            # 过程噪声协方差 Q_k = exp(log_var)
+            ctrl_var_batch = np.exp(p_rel_logvar.cpu().numpy())
 
-            # B. 软解码 (Soft Decode) - 用于生成高精度轨迹
-            # 直接调用我们在 trainc.py 中使用的 soft expectation
-            # 注意：这需要 logits，而不是 binary vector
-            pred_h_soft_batch = quantizer.decode_soft_expectation(logits_h).cpu().numpy()
+            # 准备结果容器
+            batch_current_size = meas_val_batch.shape[0]
+            fused_headings = np.zeros((batch_current_size, 1))
 
-            # === 4. 收集结果 ===
+            if not use_kf_fusion:
+                fused_headings = meas_val_batch.copy()
+            else:
+                # === 4. 动态卡尔曼滤波循环 ===
+                for i in range(batch_current_size):
+                    # 获取当前步的参数
+                    z_k = meas_val_batch[i, 0]      # 绝对航向观测值
+                    R_k = meas_var_batch[i, 0]      # 绝对航向不确定性 (R)
+                    
+                    u_k = ctrl_val_batch[i, 0]      # 相对航向增量
+                    Q_k = ctrl_var_batch[i, 0]      # 相对航向不确定性 (Q)
+
+                    if state_x is None:
+                        # 初始化：第一帧直接使用观测值，初始方差设为观测方差
+                        state_x = z_k
+                        state_p = R_k
+                    else:
+                        # --- A. 预测步 (Predict) ---
+                        # 1. 状态预测: X_pred = X_prev + u
+                        x_pred = state_x + u_k
+                        
+                        # 2. 协方差预测: P_pred = P_prev + Q
+                        p_pred = state_p + Q_k
+
+                        # --- B. 更新步 (Update) ---
+                        # 3. 计算卡尔曼增益 K = P_pred / (P_pred + R)
+                        # K 动态决定了我们多信赖观测值 z_k
+                        # 如果 R_k 很大(Abs不准)，K 就会变小，状态主要由积分决定
+                        K = p_pred / (p_pred + R_k + 1e-8)
+
+                        # 4. 计算残差 (Innovation): y = z - X_pred
+                        # [关键] 必须处理角度周期性
+                        innovation = z_k - x_pred
+                        innovation = (innovation + np.pi) % (2 * np.pi) - np.pi
+
+                        # 5. 更新状态: X_new = X_pred + K * y
+                        state_x = x_pred + K * innovation
+                        
+                        # 6. 更新协方差: P_new = (1 - K) * P_pred
+                        state_p = (1 - K) * p_pred
+
+                    # 保持状态在 [-pi, pi]
+                    state_x = (state_x + np.pi) % (2 * np.pi) - np.pi
+                    fused_headings[i, 0] = state_x
+
+            # === 5. 收集结果 ===
             preds_len.append(pred_l.cpu().numpy())
-            preds_head_soft.append(pred_h_soft_batch.reshape(-1, 1))
-            preds_head_hard.append(pred_h_hard_batch.reshape(-1, 1))
+            preds_head_fused.append(fused_headings)
+            preds_head_abs.append(meas_val_batch) # 记录 Abs 均值用于对比
             
-            if return_binary:
-                preds_binary_probs.append(pred_binary)
-                preds_binary_hard.append(pred_binary_hard_batch)
-                preds_logits.append(logits_h.cpu().numpy())
-            
-            # 清理显存 (对于大文件很重要)
-            del xb, feat_l, pred_l, feat_h, logits_h
-                
-    pred_len = np.concatenate(preds_len, axis=0)
-    pred_head_soft = np.concatenate(preds_head_soft, axis=0)
-    pred_head_hard = np.concatenate(preds_head_hard, axis=0)
-    
-    if return_binary:
-        pred_binary_probs = np.concatenate(preds_binary_probs, axis=0)
-        pred_binary_hard = np.concatenate(preds_binary_hard, axis=0)
-        pred_logits = np.concatenate(preds_logits, axis=0)
-        return pred_len, pred_head_soft, pred_head_hard, pred_binary_probs, pred_binary_hard, pred_logits
-    else:
-        return pred_len, pred_head_soft, pred_head_hard
+            preds_logits.append(meas_val_batch) # 这里用 Abs 均值代替 Logits
 
+            # 清理显存
+            del xb, feat_l, pred_l
+            del p_abs_mu, p_abs_logvar, p_rel_mu, p_rel_logvar
+
+    # 合并所有批次的结果
+    pred_len = np.concatenate(preds_len, axis=0)
+    pred_head_fused = np.concatenate(preds_head_fused, axis=0)
+    pred_head_abs = np.concatenate(preds_head_abs, axis=0)
+    
+    # 兼容旧接口的返回值
+    pred_logits = np.concatenate(preds_logits, axis=0)
+
+    return pred_len, pred_head_fused, pred_head_abs, pred_logits
 
 def main():
     project_dir = "/home/admin407/code/zyshe/NavCorrector"
     data_root = os.path.join(project_dir, "OXIOD")
     selfmade_root = os.path.join(project_dir, "SELFMADE")
     ronin_root = os.path.join(project_dir, "RONIN")
-    ckpt_dir = os.path.join(project_dir, "checkpoints_cls")
+    ckpt_dir = os.path.join(project_dir, f"checkpoints_cls_{dataset}")
     output_dir = os.path.join(project_dir, f"output/testc_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
     os.makedirs(output_dir, exist_ok=True)
 
     print("="*60)
-    print("航向角量化分类测试（自适应非均匀量化版）")
+    print("绝对航向回归测试（仅绝对航向）")
     print("="*60)
-    print(f"  编码模式: {encoding_mode}")
-    print(f"  位数: {num_bits} bits -> {num_bins} bins")
+    print(f"  模型结构: DualHeadingModel (基于ResNet回归)")
+    print(f"  绝对航向: 直接回归 [-π, π]")
+    print(f"  相对航向: 关闭")
+    print(f"  融合方式: {'卡尔曼滤波' if use_kf_fusion else '关闭'}")
     print("="*60)
 
-    # 加载模型和量化器
-    print("\n正在加载预训练模型和量化器...")
-    models, quantizer = load_models(ckpt_dir, device)
+    # 加载模型
+    print("\n正在加载预训练双流模型...")
+    models = load_models(ckpt_dir, device)
     print("模型加载完成！")
-    
-    # 打印量化器信息
-    if quantizer.fitted:
-        bin_widths = np.diff(quantizer.bin_edges)
-        print(f"\n量化器信息:")
-        print(f"  类型: {'自适应' if quantizer.adaptive else '均匀'}")
-        print(f"  Bin 宽度范围: [{np.degrees(bin_widths.min()):.2f}deg, {np.degrees(bin_widths.max()):.2f}deg]")
-        print(f"  Bin 宽度中位数: {np.degrees(np.median(bin_widths)):.2f}deg")
 
     # 测试文件列表
     if dataset == "SELFMADE" and os.path.isdir(selfmade_root):
@@ -215,10 +258,10 @@ def main():
         imu_files = sorted(imu_files)
         gt_files = [None] * len(imu_files)
     elif dataset == "RONIN" and os.path.isdir(ronin_root):
-        list_seen = os.path.join(ronin_root, 'lists', 'list_test_seen.txt')
-        with open(list_seen) as f:
+        list_unseen = os.path.join(ronin_root, 'lists', 'list_test_unseen.txt')
+        with open(list_unseen) as f:
             names = [s.strip() for s in f.readlines() if len(s) > 0 and s[0] != '#']
-        imu_files = [os.path.join(ronin_root, 'Data', 'seen_subjects_test_set', n) for n in names]
+        imu_files = [os.path.join(ronin_root, 'Data', 'unseen_subjects_test_set', n) for n in names]
         gt_files = [None] * len(imu_files)
     else:
         imu_files = [
@@ -258,11 +301,6 @@ def main():
             gyro, acc, pos3d, ori = gyro[:vis_num1], acc[:vis_num1], pos3d[:vis_num1], ori[:vis_num1]
         pos2d = pos3d[:, :2]
         
-        if dataset == "SELFMADE" or dataset == "RONIN":
-            head = ori[:, 0]
-        else:
-            head = yaw_from_quaternion_array(ori)
-            
         if dataset == "RONIN":
             window_fn = ronin_window
         elif dataset == "SELFMADE":
@@ -279,7 +317,7 @@ def main():
             filter_window = 20  # OXIOD 数据集使用位置平滑
         
         # 先获取平滑前的真值（用于对比）
-        [gx_raw, ax_raw], [dl_raw, dh_raw], init_l_raw, init_h_raw = window_fn(
+        [gx_raw, ax_raw], [dl_raw, dh_abs_raw, dh_rel_raw], init_l_raw, init_h_raw = window_fn(
             gyro, acc, pos3d, ori,
             mode="2d",
             window_size=window_size,
@@ -288,19 +326,23 @@ def main():
             smooth_heading=False,  # 不平滑航向角
             smooth_length=False,    # 不平滑步长
         )
-            
+
         # 再获取平滑后的真值（用于训练和评估）
-        [gx, ax], [dl, dh], init_l, init_h = window_fn(
+        [gx, ax], [dl, dh_abs, dh_rel], init_l, init_h = window_fn(
             gyro, acc, pos3d, ori,
             mode="2d",
             window_size=window_size,
             stride=stride,
             filter_window=filter_window,
-            smooth_heading=True,  # 启用航向角平滑，与训练时保持一致
+            smooth_heading=True,  # 启用航向角平滑，用于显示平滑后的轨迹
             heading_sigma=1.5,    # 航向角高斯平滑标准差
             smooth_length=False,   # 不平滑步长，只平滑航向
             length_sigma=1.0,    # 步长高斯平滑标准差
         )
+
+        # 为兼容性，将绝对航向作为主要航向
+        dh_raw = dh_abs_raw
+        dh = dh_abs
         
         if gx.shape[0] == 0:
             print("窗口长度不足，跳过该序列")
@@ -314,10 +356,14 @@ def main():
             parts = rel_path.split(os.sep)
             base_name = f"{parts[-3]}_{parts[-1].split('.')[0]}"
             
-        # 预测（同时获取二进制编码用于统计）
-        pred_len, pred_head_soft, pred_head_hard, pred_binary_probs, pred_binary_hard, pred_logits = predict_in_batches(
-            models, quantizer, gx, ax, batch_size=batch_size, temperature=1.0, return_binary=True
+        # 预测（双流航向 + 互补滤波融合）
+        pred_len, pred_head_fused, pred_head_abs, pred_logits = predict_in_batches(
+            models, gx, ax, batch_size=batch_size
         )
+
+        # 为了兼容性，将融合结果作为主要预测结果
+        pred_head_soft = pred_head_fused  # 用于轨迹重建的主要航向
+        pred_head_hard = pred_head_abs    # 用于统计的绝对航向
     
         # 对齐数据长度
         min_len = min(len(dl), len(dh), len(pred_len), len(pred_head_soft), len(pred_head_hard))
@@ -355,34 +401,18 @@ def main():
             dl_raw = None
             dh_raw = None
         
-        # 编码错误统计和可视化（使用平滑前的真值）
-        file_prefix = base_name
-        # 使用平滑前的真值进行编码错误分析
-        dh_gt_for_encoding = dh_raw if dh_raw is not None else dh
-        dh_np = dh_gt_for_encoding[:len(pred_binary_probs)] if len(pred_binary_probs) <= len(dh_gt_for_encoding) else dh_gt_for_encoding
-        if isinstance(dh_np, torch.Tensor):
-            dh_np = dh_np.cpu().numpy()
-        if dh_np.ndim > 1:
-            dh_np = dh_np[:, 0] if dh_np.shape[1] == 1 else dh_np.flatten()
-        
-        analyze_encoding_errors(
-            dh_np,
-            pred_binary_probs,
-            pred_binary_hard,
-            quantizer,
-            output_bits,
-            output_dir,
-            file_prefix
-        )
+        # 对于回归方法，跳过编码错误分析（回归方法没有编码概念）
+        print(f"  跳过编码错误分析（回归方法）")
 
-        # 生成轨迹（基于步长+航向角累积）
-        traj_gt = generate_trajectory_2d(init_l, init_h, dl, dh[:len(dl)])
-        traj_pred = generate_trajectory_2d(init_l, init_h, pred_len, pred_head_soft[:len(pred_len)])
+        # [修改] 生成轨迹（基于步长+绝对航向）
+        # 对于绝对航向，不再需要传入init_h（设为0即可）
+        traj_gt = generate_trajectory_2d(init_l, 0.0, dl, dh[:len(dl)])
+        traj_pred = generate_trajectory_2d(init_l, 0.0, pred_len, pred_head_soft[:len(pred_len)])
         
         # 生成平滑前的轨迹（用于对比）
         traj_gt_raw = None
         if dl_raw is not None and dh_raw is not None:
-            traj_gt_raw = generate_trajectory_2d(init_l_raw, init_h_raw, dl_raw, dh_raw[:len(dl_raw)])
+            traj_gt_raw = generate_trajectory_2d(init_l_raw, 0.0, dl_raw, dh_raw[:len(dl_raw)])
 
         # 计算 dataset_OXIOD 中使用的起始索引
         start_frame_idx = window_size // 2 - stride // 2  # 例如 160//2 - 32//2 = 64
@@ -466,19 +496,15 @@ def main():
         plot_trajectory_comparison(traj_gt, traj_gt_xy, traj_pred, output_dir, base_name,
                                  traj_gt_raw=traj_gt_raw, traj_pdr=traj_pdr, vis_num=vis_len if show_full_trajectory else None)
 
-        # ==================== 新增：真值 vs 预测 双箭头矢量图 ====================
-        
-        # 1. 准备预测值的绝对航向 (N,)
-        dh_pred_steps = pred_head_soft[:len(pred_vis)-1, 0]
-        cum_headings_pred = init_h + np.cumsum(dh_pred_steps)
-        vis_headings_pred = np.concatenate([[init_h], cum_headings_pred])
-        
-        # 2. 准备真值的绝对航向 (N,)
-        # dh 是真值变化量，长度通常 >= len(pred_vis)
-        # 我们截取对应的长度
-        dh_gt_steps = dh[:len(pred_vis)-1, 0]
-        cum_headings_gt = init_h + np.cumsum(dh_gt_steps)
-        vis_headings_gt = np.concatenate([[init_h], cum_headings_gt])
+        # ==================== [修改] 新增：真值 vs 预测 双箭头矢量图 ====================
+
+        # 1. [修改] 准备预测值的绝对航向 (N,)
+        # 对于绝对航向，pred_head_soft已经是绝对航向，直接使用
+        vis_headings_pred = pred_head_soft[:len(pred_vis), 0]
+
+        # 2. [修改] 准备真值的绝对航向 (N,)
+        # 对于绝对航向，dh已经是绝对航向，直接使用
+        vis_headings_gt = dh[:len(pred_vis), 0]
         
         # 3. 调用绘图
         plot_trajectory_with_quiver(
@@ -495,28 +521,26 @@ def main():
 
         # ==================== 新增：瞬时转向误差双箭头分析图 ====================
         
-        # A. 准备基础数据
-        # 截取长度对齐 (N-1)
-        steps_len = len(pred_vis) - 1
-        dh_pred_steps = pred_head_soft[:steps_len, 0]  # 预测的转向 (dtheta)
-        dh_gt_steps = dh[:steps_len, 0]                # 真值的转向 (dtheta)
-        
-        # B. 计算预测绝对航向 (Red Arrow Data)
-        cum_headings_pred = init_h + np.cumsum(dh_pred_steps)
-        vis_headings_pred = np.concatenate([[init_h], cum_headings_pred])
-        
-        # C. 计算"局部真值"航向 (Purple Arrow Data)
-        # 逻辑：Local_Truth = Pred_Heading + (GT_Turn - Pred_Turn)
-        # 这消除了历史累积误差，只展示"这一步"的转向误差
-        
-        # 计算瞬时转向误差
-        turn_error = dh_gt_steps - dh_pred_steps
-        
-        # 构造局部真值数组
-        # 第0步完全重合
-        # 从第1步开始，局部真值 = 预测值 + 误差
-        vis_headings_local_truth = vis_headings_pred.copy()
-        vis_headings_local_truth[1:] = vis_headings_pred[1:] + turn_error
+        # A. [修改] 准备基础数据 - 对于绝对航向
+        # 截取长度对齐 (N)
+        steps_len = len(pred_vis)
+        abs_h_pred = pred_head_soft[:steps_len, 0]  # 预测的绝对航向
+        abs_h_gt = dh[:steps_len, 0]                 # 真值的绝对航向
+
+        # B. [修改] 预测绝对航向 (Red Arrow Data)
+        vis_headings_pred = abs_h_pred
+
+        # C. [修改] 计算"局部真值"航向 (Purple Arrow Data)
+        # 对于绝对航向，我们直接使用真值的绝对航向作为局部真值
+        # 因为绝对航向没有累积误差问题
+        vis_headings_local_truth = abs_h_gt
+
+        # 计算瞬时转向误差（用于打印信息）
+        # 从绝对航向计算转向变化
+        if len(abs_h_pred) > 1:
+            turn_pred = np.diff(abs_h_pred)
+            turn_gt = np.diff(abs_h_gt)
+            turn_error = turn_gt - turn_pred
         
         # D. 调用绘图
         plot_trajectory_turn_error_quiver(
@@ -530,15 +554,18 @@ def main():
         print(f"  瞬时转向误差分析图保存至: {base_name}_turn_error_quiver.png")
         
         # 打印最大突变点，方便在Log中快速定位
-        max_err_idx = np.argmax(np.abs(turn_error))
-        max_err_deg = np.degrees(np.abs(turn_error[max_err_idx]))
-        print(f"  > 最大单步转向突变: {max_err_deg:.2f}° (at step {max_err_idx})")
+        if len(abs_h_pred) > 1:
+            max_err_idx = np.argmax(np.abs(turn_error))
+            max_err_deg = np.degrees(np.abs(turn_error[max_err_idx]))
+            print(f"  > 最大单步转向误差: {max_err_deg:.2f}° (at step {max_err_idx})")
+        else:
+            print(f"  > 数据长度不足，无法计算转向误差")
         
         # ====================================================================
 
         plot_heading_analysis(dh, pred_head_soft, pred_head_hard, vis_len,
                              os.path.join(output_dir, f"{base_name}_heading_analysis.png"),
-                             quantizer, dh_raw=dh_raw)
+                             dh_raw=dh_raw)
 
         plot_time_series(dl, dh, pred_len, pred_head_soft, vis_len,
                         os.path.join(output_dir, f"{base_name}_time_series.png"),
@@ -569,9 +596,7 @@ def main():
     print(f"  平均 RMSE: {np.mean(all_rmse):.4f}m")
     print(f"  平均 Length MAE: {np.mean(all_len_mae):.4f}m")
     print(f"  平均 Heading MAE: {np.degrees(np.mean(all_head_mae)):.2f} deg")
-    if quantizer.fitted:
-        bin_widths = np.diff(quantizer.bin_edges)
-        print(f"  量化精度范围: [{np.degrees(bin_widths.min())/2:.2f}deg, {np.degrees(bin_widths.max())/2:.2f}deg]")
+    print(f"  模型类型: 直接回归 (无量化)")
     print("="*60)
 
     print(f"\n测试完成！结果保存在: {output_dir}")

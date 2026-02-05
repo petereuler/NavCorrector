@@ -8,10 +8,12 @@ from RONIN.source.math_util import orientation_to_angles
 
 
 def wrap_angle(angle):
+    """将角度归一化到 [-pi, pi] 范围"""
     return (angle + np.pi) % (2 * np.pi) - np.pi
 
 
 def moving_average(x, k):
+    """简易滑动平均滤波"""
     if k is None or k <= 1:
         return x
     k = int(k)
@@ -26,6 +28,7 @@ def moving_average(x, k):
 
 
 def _load_sequence(seq_path):
+    """读取 RONIN 数据集的 HDF5 文件 (对齐到 Global Tango Frame)"""
     with open(os.path.join(seq_path, 'info.json')) as f:
         info = json.load(f)
     with h5py.File(os.path.join(seq_path, 'data.hdf5')) as f:
@@ -37,8 +40,12 @@ def _load_sequence(seq_path):
             init_tango_ori = quaternion.quaternion(*f['pose/tango_ori'][0])
         else:
             init_tango_ori = quaternion.quaternion(1.0, 0.0, 0.0, 0.0)
+    
+    # 标定
     gyro = gyro_uncalib - np.array(info['imu_init_gyro_bias'])
     acce = np.array(info['imu_acce_scale']) * (acce_uncalib - np.array(info['imu_acce_bias']))
+    
+    # 处理姿态源
     ori_src = info.get('ori_source', 'game_rv')
     with h5py.File(os.path.join(seq_path, 'data.hdf5')) as f:
         if ori_src == 'game_rv' and 'synced/game_rv' in f.keys():
@@ -47,45 +54,61 @@ def _load_sequence(seq_path):
             ori = np.copy(f['synced/rv'])
         else:
             ori = np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (ts.shape[0], 1))
+            
     ori_q = quaternion.from_float_array(ori)
+    
+    # [对齐] IMU -> Tango 坐标系
     rot_imu_to_tango = quaternion.quaternion(*info.get('start_calibration', [1.0, 0.0, 0.0, 0.0]))
     init_rotor = init_tango_ori * rot_imu_to_tango * ori_q[0].conj()
     ori_q = init_rotor * ori_q
+    
+    # 旋转 IMU 数据
     nz = np.zeros((gyro.shape[0], 1))
     gyro_q = quaternion.from_float_array(np.concatenate([nz, gyro], axis=1))
     acce_q = quaternion.from_float_array(np.concatenate([nz, acce], axis=1))
     glob_gyro = quaternion.as_float_array(ori_q * gyro_q * ori_q.conj())[:, 1:]
     glob_acce = quaternion.as_float_array(ori_q * acce_q * ori_q.conj())[:, 1:]
+    
     dt = (ts[1:] - ts[:-1])[:, None]
     glob_v = (tango_pos[1:] - tango_pos[:-1]) / dt
     ts = ts[1:]
+    
     return ts, np.concatenate([glob_gyro[1:], glob_acce[1:]], axis=1), glob_v[:, :2], quaternion.as_float_array(ori_q)[1:], tango_pos[1:]
 
 
 def load_ronin_raw(seq_path):
+    """加载 RONIN 原始数据"""
     ts, feat, vel2, ori, pos = _load_sequence(seq_path)
     gyro = feat[:, :3]
     acc = feat[:, 3:6]
     pos3 = pos
+    
+    # 提取 Yaw (从已对齐的四元数中提取)
+    # 这代表了设备在 Global Tango Frame 下的真实朝向
     angles = orientation_to_angles(ori)
     yaw = angles[:, 0]
-    
-    # RONIN数据集降采样2（每隔一个样本取一个）
-    # gyro = gyro[::2]
-    # acc = acc[::2]
-    # pos3 = pos3[::2]
-    # yaw = yaw[::2]
     
     return gyro, acc, pos3, yaw.reshape(-1, 1)
 
 
+def load_ronin_raw_pose(seq_path):
+    """加载 RONIN 原始数据（返回姿态四元数）"""
+    _, feat, _, ori, pos = _load_sequence(seq_path)
+    gyro = feat[:, :3]
+    acc = feat[:, 3:6]
+    pos3 = pos
+    return gyro, acc, pos3, ori
+
+
 def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d", window_size=200, stride=10, filter_window=10, smooth_heading=True, heading_sigma=1, smooth_length=False, length_sigma=1.0):
+    """构建窗口化数据集 (修正静止航向问题)"""
     mid = window_size // 2 - stride // 2
     m = min(gyro_data.shape[0], acc_data.shape[0], pos_data.shape[0], ori_data.shape[0])
     gyro_data = gyro_data[:m]
     acc_data = acc_data[:m]
     pos_data = pos_data[:m]
     ori_data = ori_data[:m]
+
     if mode == "2d":
         pos2d = pos_data[:, :2]
         if filter_window and filter_window > 1:
@@ -94,18 +117,14 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d", window_si
         x_gyro = []
         x_acc = []
         y_len = []
-        y_head = []
+        y_head_abs = []  # 绝对航向
+        y_head_rel = []  # 相对航向
         
-        # init_pos & init_head
         idx_0 = 0
         a_0 = idx_0 + window_size // 2 - stride // 2
-        b_0 = idx_0 + window_size // 2 + stride // 2
         a_0 = max(0, min(a_0, len(pos2d)-1))
-        b_0 = max(0, min(b_0, len(pos2d)-1))
         init_pos = pos2d[a_0, :]
-        
-        diff_0 = pos2d[b_0] - pos2d[a_0]
-        init_head = float(np.arctan2(diff_0[1], diff_0[0]))
+        init_head = 0.0
 
         max_start = gyro_data.shape[0] - window_size - 1
         for i, idx in enumerate(range(0, max_start, stride)):
@@ -122,59 +141,104 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d", window_si
             pa = pos2d[a, :]
             pb = pos2d[b, :]
             
+            # 1. 步长 (弦长)
             delta_len = np.linalg.norm(pb - pa)
             
+            # 2. [关键修正] 绝对航向计算
             curr_diff = pb - pa
-            if np.linalg.norm(curr_diff) < 1e-6:
-                curr_chord_angle = 0.0 if i == 0 else prev_chord_angle
-            else:
-                curr_chord_angle = np.arctan2(curr_diff[1], curr_diff[0])
+            displacement = np.linalg.norm(curr_diff)
             
-            if i == 0:
-                delta_head = 0.0
+            # 阈值判断：如果位移小于 2cm，认为静止
+            # 此时位移方向(Course)全是噪声，必须使用真实Yaw(Heading)代替
+            if displacement < 0.1: 
+                # 获取当前窗口中间时刻的索引
+                center_k = (a + b) // 2
+                center_k = max(0, min(center_k, len(ori_data)-1))
+                # 使用真实 Yaw 作为标签 (保持朝向)
+                abs_heading = ori_data[center_k, 0]
             else:
-                prev_a = a - stride
-                if prev_a < 0:
-                    delta_head = 0.0
-                else:
-                    prev_p = pos2d[prev_a]
-                    prev_diff = pa - prev_p
-                    if np.linalg.norm(prev_diff) < 1e-6:
-                        prev_chord_angle = curr_chord_angle
-                    else:
-                        prev_chord_angle = np.arctan2(prev_diff[1], prev_diff[0])
-                    delta_head = wrap_angle(curr_chord_angle - prev_chord_angle)
+                # 运动状态：使用位移方向
+                abs_heading = np.arctan2(curr_diff[1], curr_diff[0])
             
             y_len.append(np.array([delta_len], dtype=np.float32))
-            y_head.append(np.array([delta_head], dtype=np.float32))
+            y_head_abs.append(np.array([abs_heading], dtype=np.float32))
 
         x_gyro = np.array(x_gyro)
         x_acc = np.array(x_acc)
         y_len = np.array(y_len)
-        y_head = np.array(y_head)
+        y_head_abs = np.array(y_head_abs)
 
-        # # 在平滑之前进行数据清洗：基于步长判断静止状态
-        # # 如果步长绝对值小于阈值，说明处于静止状态，将步长和航向角都设为0
-        # if len(y_len) > 0 and len(y_head) > 0:
-        #     # 基于步长判断是否静止
-        #     stationary_mask = np.abs(y_len.flatten()) < 0.01  # 步长小于1cm认为静止
+        # 数据清洗：静止处理
+        if len(y_len) > 0 and len(y_head_abs) > 0:
+            # 标记静止帧
+            stationary_mask = np.abs(y_len.flatten()) < 0.1
+            
+            # 1. 步长设为 0 (正确)
+            y_len[stationary_mask, 0] = 0.0
+            
+            # 2. [重要] 不要把航向设为 0！
+            # 删除了 y_head_abs[stationary_mask, 0] = 0.0 这行有害代码
+            # 因为我们在上面循环里已经填入了正确的 ori_data 真值
 
-        #     # 将静止状态的样本标签设为0
-        #     y_len[stationary_mask, 0] = 0.0
-        #     y_head[stationary_mask, 0] = 0.0
-
-        # 对步长进行平滑处理（提高真值轨迹的光滑性）
+        # 平滑步长
         if smooth_length and len(y_len) > 0:
             y_len_smooth = gaussian_filter1d(y_len.flatten(), sigma=length_sigma)
             y_len = y_len_smooth.reshape(-1, 1)
         
-        # 对航向角进行平滑处理（提高真值轨迹的光滑性）
-        if smooth_heading and len(y_head) > 0:
-            y_head_smooth = gaussian_filter1d(y_head.flatten(), sigma=heading_sigma)
-            y_head = y_head_smooth.reshape(-1, 1)
-        
-        return [x_gyro, x_acc], [y_len, y_head], init_pos, init_head
-    elif mode == "3d":
-        raise ValueError("RONIN helper only provides 2d windows here")
-    else:
-        raise ValueError("mode must be '2d' or '3d'")
+        # 平滑航向角 (解决 Course 和 Heading 切换时的微小突变)
+        if smooth_heading and len(y_head_abs) > 0:
+            flat_head_abs = y_head_abs.flatten()
+            unwrapped_head_abs = np.unwrap(flat_head_abs)
+            smoothed_unwrapped_abs = gaussian_filter1d(unwrapped_head_abs, sigma=heading_sigma)
+            
+            rel_headings_unwrapped = np.zeros_like(smoothed_unwrapped_abs)
+            rel_headings_unwrapped[1:] = np.diff(smoothed_unwrapped_abs)
+
+            y_head_abs_smooth = wrap_angle(smoothed_unwrapped_abs)
+            y_head_abs = y_head_abs_smooth.reshape(-1, 1)
+            y_head_rel = rel_headings_unwrapped.reshape(-1, 1).astype(np.float32)
+        else:
+            y_head_rel = np.zeros((len(y_head_abs), 1), dtype=np.float32)
+            if len(y_head_abs) > 1:
+                unwrapped_abs = np.unwrap(y_head_abs.flatten())
+                y_head_rel[1:, 0] = np.diff(unwrapped_abs)
+
+        return [x_gyro, x_acc], [y_len, y_head_abs, y_head_rel], init_pos, init_head
+
+
+def window_pose_dataset(gyro_data, acc_data, ori_data, window_size=200, stride=10, smooth_quat=True, quat_sigma=1.0):
+    """
+    构建用于相对姿态估计的窗口化数据集（目标为 stride 时间间隔内的四元数增量）。
+    """
+    x_gyro = []
+    x_acc = []
+    y_quat = []
+
+    max_start = gyro_data.shape[0] - window_size - 1
+    for idx in range(0, max_start, stride):
+        xg = gyro_data[idx + 1: idx + 1 + window_size, :]
+        xa = acc_data[idx + 1: idx + 1 + window_size, :]
+
+        a = idx + window_size // 2 - stride // 2
+        b = idx + window_size // 2 + stride // 2
+        a = max(0, min(a, len(ori_data) - 1))
+        b = max(0, min(b, len(ori_data) - 1))
+        q_a = quaternion.from_float_array(ori_data[a])
+        q_b = quaternion.from_float_array(ori_data[b])
+        q_delta = q_b * q_a.conj()
+
+        x_gyro.append(xg)
+        x_acc.append(xa)
+        y_quat.append(quaternion.as_float_array(q_delta).astype(np.float32))
+
+    x_gyro = np.array(x_gyro)
+    x_acc = np.array(x_acc)
+    y_quat = np.array(y_quat)
+
+    if smooth_quat and len(y_quat) > 1:
+        y_quat = gaussian_filter1d(y_quat, sigma=quat_sigma, axis=0)
+        norms = np.linalg.norm(y_quat, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-8)
+        y_quat = y_quat / norms
+
+    return [x_gyro, x_acc], y_quat

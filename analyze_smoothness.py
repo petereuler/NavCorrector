@@ -288,7 +288,7 @@ def analyze_heading_smoothness(data_root, output_dir, dataset="OXIOD"):
 
 
 def main():
-    project_dir = "/home/admin407/code/zyshe/Corrector"
+    project_dir = "/home/admin407/code/zyshe/NavCorrector"
     
     # 数据集选择：'OXIOD', 'SELFMADE', 'RONIN'
     dataset = os.getenv('DATASET', 'OXIOD').upper()
@@ -312,4 +312,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

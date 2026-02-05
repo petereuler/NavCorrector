@@ -169,9 +169,11 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d", window_si
         x_gyro = []
         x_acc = []
         y_len = []
-        y_head = []
+        y_head_abs = []  # 绝对航向标签
+        y_head_rel = []  # 相对航向标签
 
         # init_pos & init_head
+        # [修改] 对于绝对航向，我们不需要init_head，因为模型直接预测绝对航向
         idx_0 = 0
         a_0 = idx_0 + window_size // 2 - stride // 2
         b_0 = idx_0 + window_size // 2 + stride // 2
@@ -179,8 +181,7 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d", window_si
         b_0 = max(0, min(b_0, len(pos2d)-1))
         init_pos = pos2d[a_0, :]
         
-        diff_0 = pos2d[b_0] - pos2d[a_0]
-        init_head = float(np.arctan2(diff_0[1], diff_0[0]))
+        init_head = 0.0  # [修改] 设为0，不再使用
 
         max_start = gyro_data.shape[0] - window_size - 1
         for i, idx in enumerate(range(0, max_start, stride)):
@@ -197,72 +198,71 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data, mode="2d", window_si
             pa = pos2d[a, :]
             pb = pos2d[b, :]
             
+            # 1. 步长 (弦长)
             delta_len = np.linalg.norm(pb - pa)
             
+            # 2. [修改] 绝对航向：当前步的位移方向
             curr_diff = pb - pa
+            # 处理静止情况，防止 NaN
             if np.linalg.norm(curr_diff) < 1e-6:
-                # Handle stationary case
-                if i == 0:
-                    curr_chord_angle = 0.0
-                else:
-                    # Use previous angle if stationary
-                    # We need to compute prev angle first if we want to use it
-                    pass
+                abs_heading = 0.0  # 静止时设为0
             else:
-                curr_chord_angle = np.arctan2(curr_diff[1], curr_diff[0])
-            
-            if i == 0:
-                delta_head = 0.0
-                # Define for safety, though i=0 logic handles it
-                pass 
-            else:
-                prev_a = a - stride
-                if prev_a < 0:
-                    delta_head = 0.0
-                else:
-                    prev_p = pos2d[prev_a]
-                    prev_diff = pa - prev_p
-                    if np.linalg.norm(prev_diff) < 1e-6:
-                        # If previous step was stationary, assume continuity
-                        prev_chord_angle_val = curr_chord_angle 
-                    else:
-                        prev_chord_angle_val = np.arctan2(prev_diff[1], prev_diff[0])
-                    
-                    # Handle current stationary case using prev angle
-                    if np.linalg.norm(curr_diff) < 1e-6:
-                         curr_chord_angle = prev_chord_angle_val
-
-                    delta_head = wrap_angle(curr_chord_angle - prev_chord_angle_val)
+                abs_heading = np.arctan2(curr_diff[1], curr_diff[0])
             
             y_len.append(np.array([delta_len], dtype=np.float32))
-            y_head.append(np.array([delta_head], dtype=np.float32))
+            y_head_abs.append(np.array([abs_heading], dtype=np.float32))
+            # 相对航向将在平滑处理后计算
             
         x_gyro = np.array(x_gyro)
         x_acc = np.array(x_acc)
         y_len = np.array(y_len)
-        y_head = np.array(y_head)
-        
+        y_head_abs = np.array(y_head_abs)
+
         # 在平滑之前进行数据清洗：基于步长判断静止状态
         # 如果步长绝对值小于阈值，说明处于静止状态，将步长和航向角都设为0
-        if len(y_len) > 0 and len(y_head) > 0:
+        if len(y_len) > 0 and len(y_head_abs) > 0:
             # 基于步长判断是否静止
             stationary_mask = np.abs(y_len.flatten()) < 0.01  # 步长小于1cm认为静止
 
             # 将静止状态的样本标签设为0
             y_len[stationary_mask, 0] = 0.0
-            y_head[stationary_mask, 0] = 0.0
+            y_head_abs[stationary_mask, 0] = 0.0
 
         # 对步长进行平滑处理（提高真值轨迹的光滑性）
         if smooth_length and len(y_len) > 0:
             y_len_smooth = gaussian_filter1d(y_len.flatten(), sigma=length_sigma)
             y_len = y_len_smooth.reshape(-1, 1)
         
-        # 对航向角进行平滑处理（提高真值轨迹的光滑性）
-        if smooth_heading and len(y_head) > 0:
-            y_head_smooth = gaussian_filter1d(y_head.flatten(), sigma=heading_sigma)
-            y_head = y_head_smooth.reshape(-1, 1)
-        
-        return [x_gyro, x_acc], [y_len, y_head], init_pos, init_head
+        # 对绝对航向进行平滑处理，并计算相对航向
+        if smooth_heading and len(y_head_abs) > 0:
+            flat_head_abs = y_head_abs.flatten()
+
+            # 1. 解缠 (Unwrap): 消除 +/- pi 的跳变
+            unwrapped_head_abs = np.unwrap(flat_head_abs)
+
+            # 2. 平滑 (Smooth): 在连续空间进行高斯滤波
+            smoothed_unwrapped_abs = gaussian_filter1d(unwrapped_head_abs, sigma=heading_sigma)
+
+            # 3. 计算相对航向：在unwrap空间计算差分
+            # 注意：第一个元素没有前一个值，设为0
+            rel_headings_unwrapped = np.zeros_like(smoothed_unwrapped_abs)
+            rel_headings_unwrapped[1:] = np.diff(smoothed_unwrapped_abs)
+
+            # 4. 重缠绝对航向 (Rewrap): 变回 [-pi, pi] 范围
+            y_head_abs_smooth = wrap_angle(smoothed_unwrapped_abs)
+            y_head_abs = y_head_abs_smooth.reshape(-1, 1)
+
+            # 5. 相对航向保持在连续空间（无需rewrap，因为是差分）
+            y_head_rel = rel_headings_unwrapped.reshape(-1, 1).astype(np.float32)
+        else:
+            # 如果不平滑，直接计算相对航向
+            y_head_rel = np.zeros((len(y_head_abs), 1), dtype=np.float32)
+            if len(y_head_abs) > 1:
+                # 在unwrap空间计算差分
+                unwrapped_abs = np.unwrap(y_head_abs.flatten())
+                y_head_rel[1:, 0] = np.diff(unwrapped_abs)
+
+        return [x_gyro, x_acc], [y_len, y_head_abs, y_head_rel], init_pos, init_head
     elif mode == "3d":
         raise ValueError("SELFMADE only supports 2d mode here")
     else:

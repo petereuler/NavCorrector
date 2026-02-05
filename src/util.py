@@ -2,25 +2,26 @@ import numpy as np
 
 def generate_trajectory_2d(init_p, init_h, delta_l_list, delta_h_list):
     """
-    使用步长（Δl）与航向角增量（Δψ）在平面内重建轨迹
+    [修改] 使用步长（Δl）与绝对航向角（ψ）在平面内重建轨迹
+    不再累加航向变化，直接使用预测的绝对航向
     """
     trajectory = [init_p.copy()]
     current_p = init_p.copy()
-    current_h = init_h
+    # [修改] 对于绝对航向，不再需要维护current_h
 
     delta_l_list = np.squeeze(delta_l_list)      # (N, 1) → (N,)
-    delta_h_list = np.squeeze(delta_h_list)  # (N, 1) → (N,)
+    delta_h_list = np.squeeze(delta_h_list)  # (N, 1) → (N,) 现在这是绝对航向
 
-    for dl, dh in zip(delta_l_list, delta_h_list):
+    for dl, abs_h in zip(delta_l_list, delta_h_list):
         # 若仍是 array([x])，则 item() 提取纯标量
         if hasattr(dl, 'item'):
             dl = dl.item()
-        if hasattr(dh, 'item'):
-            dh = dh.item()
+        if hasattr(abs_h, 'item'):
+            abs_h = abs_h.item()
 
-        current_h = (current_h + dh + np.pi) % (2 * np.pi) - np.pi
-        dx = dl * np.cos(current_h)
-        dy = dl * np.sin(current_h)
+        # [修改] 直接使用绝对航向，不再累加
+        dx = dl * np.cos(abs_h)
+        dy = dl * np.sin(abs_h)
 
         current_p = current_p + np.array([dx, dy])
         trajectory.append(current_p.copy())
