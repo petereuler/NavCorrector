@@ -177,7 +177,9 @@ def plot_trajectory_comparison(traj_gt, traj_gt_xy, traj_pred, output_dir, base_
     
     plt.suptitle(f'Trajectory Comparison Analysis - {base_name}', fontsize=14, fontweight='bold')
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f"{base_name}_trajectory.png"), bbox_inches='tight')
+    out_path = os.path.join(output_dir, f"{base_name}_trajectory.png")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    plt.savefig(out_path, bbox_inches='tight')
     plt.close()
     
     print(f"  轨迹对比图保存至: {base_name}_trajectory.png")

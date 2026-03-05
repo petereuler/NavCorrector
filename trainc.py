@@ -7,13 +7,19 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from models.pose_net import PoseNetTransformer, quat_conj, quat_mul, quat_to_rotmat
 from models.navigator import Navigator
-from utils.training_utils import load_data_ridi_absheading
+from utils.training_utils import load_data_oxiod_absheading, load_data_ridi_absheading
 
 # ======= 参数设置 =======
 window_size = 64   # 约 1.6s ~ 3.2s
 stride = 64
 batch_size = 1024
 feat_dim = 64
+# 可选: "RIDI" / "OXIOD"
+DATASET = "RIDI"
+# 平面先验：仅在构造 dp_body 标签时把 dp_world.z 置 0
+PLANE_BODY_LABEL_ON = True
+# stage3 world 监督时的 z 轴惩罚权重（对 dp_world_pred[:,2] -> 0）
+PLANE_Z_LOSS_WEIGHT = 0.2
 
 # 优化器参数
 lr = 1e-4
@@ -26,7 +32,9 @@ joint_epochs = 200
 # 路径设置
 project_dir = "/home/admin407/code/zyshe/NavCorrector"
 ridi_root = os.path.join(project_dir, "RIDI")
-ckpt_dir = os.path.join(project_dir, "checkpoints_cls")
+oxiod_root = os.path.join(project_dir, "OXIOD")
+dataset_name = os.getenv("DATASET", DATASET).upper()
+ckpt_dir = os.path.join(project_dir, "checkpoints_cls", dataset_name.lower())
 os.makedirs(ckpt_dir, exist_ok=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -203,7 +211,8 @@ def train_navigator_corrected(
                 R_start_pred = torch.matmul(R_end, R_rel_pred.transpose(1, 2))
                 dp_world_pred = torch.matmul(R_start_pred, pred_dp_body.unsqueeze(-1)).squeeze(-1)
                 loss_world = F.mse_loss(dp_world_pred, yb_dpw)
-                loss = loss_body + 1.0 * loss_world
+                loss_z = torch.mean(dp_world_pred[:, 2] ** 2)
+                loss = loss_world + PLANE_Z_LOSS_WEIGHT * loss_z
             else:
                 loss = loss_body
 
@@ -250,7 +259,8 @@ def train_navigator_corrected(
                     R_start_pred = torch.matmul(R_end, R_rel_pred.transpose(1, 2))
                     dp_world_pred = torch.matmul(R_start_pred, pred_dp_body.unsqueeze(-1)).squeeze(-1)
                     v_loss_world = F.mse_loss(dp_world_pred, yb_dpw)
-                    v_loss = v_loss_body + 1.0 * v_loss_world
+                    v_loss_z = torch.mean(dp_world_pred[:, 2] ** 2)
+                    v_loss = v_loss_world + PLANE_Z_LOSS_WEIGHT * v_loss_z
                 else:
                     v_loss = v_loss_body
                          
@@ -270,36 +280,63 @@ def train_navigator_corrected(
 
 def main():
     print("=" * 60)
-    print("NavCorrector: PoseNet + Polar Navigator (Fixed Absolute Alignment)")
+    print(f"NavCorrector: PoseNet + Polar Navigator (Dataset={dataset_name})")
     print("=" * 60)
 
     # 1. 加载数据
     print("\n📊 加载训练数据...")
-    # PoseNet: 使用带重力加速度 (acce)
-    (x_tr_pose, _ylen_tr_pose, yrel_tr_pose,
-     x_va_pose, _ylen_va_pose, yrel_va_pose) = load_data_ridi_absheading(
-        ridi_root, device, window_size, stride,
-        return_ori=False,
-        return_rel_ori=True,
-        return_delta_p=False,
-        return_init=False,
-        acc_source="acce",
-    )
+    if dataset_name == "RIDI":
+        # PoseNet: 使用带重力加速度 (acce)
+        (x_tr_pose, _ylen_tr_pose, yrel_tr_pose,
+         x_va_pose, _ylen_va_pose, yrel_va_pose) = load_data_ridi_absheading(
+            ridi_root, device, window_size, stride,
+            return_ori=False,
+            return_rel_ori=True,
+            return_delta_p=False,
+            return_init=False,
+            acc_source="acce",
+        )
 
-    # Navigator: 使用线性加速度 (linacce)
-    (x_tr, _ylen_tr, ydp_tr, ydpw_tr, yori_tr, yrel_tr, _yinit_tr, yalign_tr,
-     x_va, _ylen_va, ydp_va, ydpw_va, yori_va, yrel_va, _yinit_va, yalign_va) = load_data_ridi_absheading(
-        ridi_root, device, window_size, stride,
-        return_ori=True,        # 用于去重力
-        return_rel_ori=True,    # 用于 PoseNet 训练
-        return_delta_p=True,    # 用于 Navigator 训练标签
-        return_delta_p_world=True,
-        return_init=True,       # 用于 Navigator 输入对齐 (绝对姿态锚点)
-        align_init_quat=True,
-        align_init_quat_to_labels=False,
-        return_align=True,
-        acc_source="linacce",
-    )
+        # Navigator: 使用线性加速度 (linacce)
+        (x_tr, _ylen_tr, ydp_tr, ydpw_tr, yori_tr, yrel_tr, _yinit_tr, yalign_tr,
+         x_va, _ylen_va, ydp_va, ydpw_va, yori_va, yrel_va, _yinit_va, yalign_va) = load_data_ridi_absheading(
+            ridi_root, device, window_size, stride,
+            return_ori=True,
+            return_rel_ori=True,
+            return_delta_p=True,
+            return_delta_p_world=True,
+            return_init=True,
+            align_init_quat=True,
+            align_init_quat_to_labels=False,
+            return_align=True,
+            acc_source="linacce",
+            flatten_world_z_for_body_label=PLANE_BODY_LABEL_ON,
+        )
+    elif dataset_name == "OXIOD":
+        # OXIOD 仅有加速度通道，Pose 和 Navigator 统一使用同一输入源
+        (x_tr_pose, _ylen_tr_pose, yrel_tr_pose,
+         x_va_pose, _ylen_va_pose, yrel_va_pose) = load_data_oxiod_absheading(
+            oxiod_root, device, window_size, stride,
+            return_ori=False,
+            return_rel_ori=True,
+            return_delta_p=False,
+            return_init=False,
+        )
+        (x_tr, _ylen_tr, ydp_tr, ydpw_tr, yori_tr, yrel_tr, _yinit_tr, yalign_tr,
+         x_va, _ylen_va, ydp_va, ydpw_va, yori_va, yrel_va, _yinit_va, yalign_va) = load_data_oxiod_absheading(
+            oxiod_root, device, window_size, stride,
+            return_ori=True,
+            return_rel_ori=True,
+            return_delta_p=True,
+            return_delta_p_world=True,
+            return_init=True,
+            align_init_quat=True,
+            align_init_quat_to_labels=False,
+            return_align=True,
+            flatten_world_z_for_body_label=PLANE_BODY_LABEL_ON,
+        )
+    else:
+        raise ValueError(f"Unsupported DATASET={dataset_name}, expected RIDI or OXIOD")
     
     # PoseNet 数据集
     pose_dataset = TensorDataset(x_tr_pose, yrel_tr_pose)

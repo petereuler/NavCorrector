@@ -11,8 +11,16 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from data.dataset_RIDI import load_ridi_raw, window_dataset as ridi_window
+from data.dataset_OXIOD import (
+    get_oxiod_predefined_split_pairs,
+    load_oxiod_raw,
+    window_dataset as oxiod_window,
+)
 from models.pose_net import PoseNetTransformer, quat_to_rotmat
 from utils.results import reconstruct_from_absolute_angles
+
+# 可选: "RIDI" / "OXIOD"
+DATASET = "RIDI"
 
 # ======= 基础工具函数 =======
 
@@ -40,6 +48,18 @@ def yaw_from_quat(q):
 def unwrap_rad(x):
     x = np.array(x, dtype=np.float32).reshape(-1)
     return np.unwrap(x)
+
+
+def align_yaw_to_motion(yaw_seq: np.ndarray, motion_heading_seq: np.ndarray) -> np.ndarray:
+    """
+    用首帧把姿态航向对齐到运动航向，避免常数偏置导致的整轨旋转错位。
+    """
+    y = np.array(yaw_seq, dtype=np.float32).reshape(-1)
+    m = np.array(motion_heading_seq, dtype=np.float32).reshape(-1)
+    if len(y) == 0 or len(m) == 0:
+        return y
+    offset = m[0] - y[0]
+    return wrap_angle(y + offset)
 
 def load_ridi_sequence(ridi_root: str, seq_name: str, window_size: int, stride: int):
     seq_dir = os.path.join(ridi_root, "data", seq_name)
@@ -85,6 +105,42 @@ def load_ridi_sequence(ridi_root: str, seq_name: str, window_size: int, stride: 
     dl = dl[:min_len]
     ori_seq = ori[b_indices[:min_len]]
 
+    return x, y_rel, heading_motion, dl, init_pos, ori_seq
+
+
+def load_oxiod_sequence(imu_file: str, gt_file: str, window_size: int, stride: int):
+    gyro, acc, pos_xyz, ori = load_oxiod_raw(imu_file, gt_file)
+    try:
+        [gx, ax], [dl, y_rel, ydp_world], init_pos, _ = oxiod_window(
+            gyro, acc, pos_xyz, ori,
+            window_size=window_size, stride=stride,
+            filter_window=20,
+            smooth_length=False, length_sigma=1.0,
+            return_rel_ori=True,
+            return_delta_p_world=True,
+        )
+    except Exception as e:
+        print(f"Error processing {imu_file}: {e}")
+        return None
+
+    x = np.concatenate([gx, ax], axis=-1)
+
+    max_start = gyro.shape[0] - window_size - 1
+    b_indices = []
+    for idx in range(0, max_start, stride):
+        b = idx + window_size // 2 + stride // 2
+        b = max(0, min(b, len(ori) - 1))
+        b_indices.append(b)
+
+    min_len = min(len(y_rel), len(b_indices))
+    if min_len == 0:
+        return None
+
+    x = x[:min_len]
+    y_rel = y_rel[:min_len]
+    heading_motion = np.arctan2(ydp_world[:min_len, 1], ydp_world[:min_len, 0]).reshape(-1, 1)
+    dl = dl[:min_len]
+    ori_seq = ori[b_indices[:min_len]]
     return x, y_rel, heading_motion, dl, init_pos, ori_seq
 
 # ======= 三大绘图函数 =======
@@ -194,9 +250,11 @@ def plot_absolute_euler(R_pred, R_gt, out_dir, seq_name):
 
 def main():
     # 配置
+    dataset_name = os.getenv("DATASET", DATASET).upper()  # RIDI / OXIOD
     ridi_root = "/home/admin407/code/zyshe/NavCorrector/RIDI"
-    ckpt_path = "/home/admin407/code/zyshe/NavCorrector/checkpoints_cls/pose_net.pth"
-    out_dir = "/home/admin407/code/zyshe/NavCorrector/output_all"
+    oxiod_root = "/home/admin407/code/zyshe/NavCorrector/OXIOD"
+    ckpt_path = f"/home/admin407/code/zyshe/NavCorrector/checkpoints_cls/{dataset_name.lower()}/pose_net.pth"
+    out_dir = f"/home/admin407/code/zyshe/NavCorrector/output_all/pose_net_{dataset_name.lower()}"
     os.makedirs(out_dir, exist_ok=True)
     
     # 参数必须与训练一致
@@ -225,22 +283,32 @@ def main():
     pose_net.eval()
 
     # 2. 获取测试列表
-    test_list_path = os.path.join(ridi_root, "data", "list_test_publish_v2.txt")
-    if not os.path.exists(test_list_path):
-        print(f"Test list not found at {test_list_path}")
+    if dataset_name == "RIDI":
+        test_list_path = os.path.join(ridi_root, "data", "list_test_publish_v2.txt")
+        if not os.path.exists(test_list_path):
+            print(f"Test list not found at {test_list_path}")
+            return
+        with open(test_list_path, "r") as f:
+            seq_specs = [("RIDI", line.strip().split(",")[0]) for line in f if line.strip()]
+    elif dataset_name == "OXIOD":
+        seq_specs = [("OXIOD", name, imu, gt) for name, imu, gt in get_oxiod_predefined_split_pairs(oxiod_root, split="test", sensor="syn")]
+    else:
+        print(f"Unsupported DATASET={dataset_name}")
         return
 
-    with open(test_list_path, "r") as f:
-        seq_names = [line.strip().split(",")[0] for line in f if line.strip()]
-    
-    print(f"Found {len(seq_names)} test sequences.")
+    print(f"Found {len(seq_specs)} test sequences.")
     
     # 统计数据
     global_z_stats = []
     
     # 3. 循环处理所有文件
-    for seq_name in tqdm(seq_names, desc="Processing"):
-        data = load_ridi_sequence(ridi_root, seq_name, window_size=WINDOW_SIZE, stride=STRIDE)
+    for spec in tqdm(seq_specs, desc="Processing"):
+        if spec[0] == "RIDI":
+            seq_name = spec[1]
+            data = load_ridi_sequence(ridi_root, seq_name, window_size=WINDOW_SIZE, stride=STRIDE)
+        else:
+            seq_name, imu_file, gt_file = spec[1], spec[2], spec[3]
+            data = load_oxiod_sequence(imu_file, gt_file, window_size=WINDOW_SIZE, stride=STRIDE)
         if data is None:
             continue
             
@@ -284,18 +352,19 @@ def main():
         yaw_phone_gt_raw = yaw_from_quat(ori_gt_seq).flatten()
         heading_motion_gt_raw = heading_motion_gt.flatten()
 
-        # 不对齐航向角，使用绝对姿态与原始运动航向
-        yaw_pred_for_traj = wrap_angle(yaw_phone_pred_raw)
+        # 轨迹示意使用与运动航向同零点的对齐版本，减少常数偏差影响
+        yaw_pred_for_traj = align_yaw_to_motion(yaw_phone_pred_raw, heading_motion_gt_raw)
         yaw_phone_pred = wrap_angle(yaw_phone_pred_raw)
         yaw_phone_gt = wrap_angle(yaw_phone_gt_raw)
         heading_motion_gt = wrap_angle(heading_motion_gt_raw)
         
         # === 生成三张图 ===
-        plot_relative_euler(R_pred_rel, R_gt_rel, out_dir, seq_name)
-        plot_trajectory_comparison(init_pos, dl, yaw_pred_for_traj, heading_motion_gt_raw, out_dir, seq_name)
-        plot_heading_analysis(yaw_phone_gt, yaw_phone_pred, heading_motion_gt, out_dir, seq_name)
+        safe_seq_name = seq_name.replace("/", "_").replace("\\", "_")
+        plot_relative_euler(R_pred_rel, R_gt_rel, out_dir, safe_seq_name)
+        plot_trajectory_comparison(init_pos, dl, yaw_pred_for_traj, heading_motion_gt_raw, out_dir, safe_seq_name)
+        plot_heading_analysis(yaw_phone_gt, yaw_phone_pred, heading_motion_gt, out_dir, safe_seq_name)
         R_abs_gt = quat_to_rotmat(torch.tensor(ori_gt_seq, dtype=torch.float32, device=device))
-        plot_absolute_euler(R_abs_tensor, R_abs_gt, out_dir, seq_name)
+        plot_absolute_euler(R_abs_tensor, R_abs_gt, out_dir, safe_seq_name)
 
     print("\n" + "="*50)
     print("ANALYSIS COMPLETE")

@@ -24,21 +24,21 @@ def accumulate_rotations(R_delta: torch.Tensor, seq_id: torch.Tensor, init_rot: 
 
 
 def compute_init_rot(ori: np.ndarray, pos_xyz: np.ndarray, window_size: int, stride: int) -> np.ndarray:
-    """Compute init rotation using pure GT orientation (no heading alignment)."""
+    """Compute init rotation using window start anchor a (no heading alignment)."""
     max_start = pos_xyz.shape[0] - window_size - 1
     if max_start <= 0:
         return np.zeros((0, 3, 3), dtype=np.float32)
 
-    b_indices = []
+    a_indices = []
     for idx in range(0, max_start, stride):
-        b = idx + window_size // 2 + stride // 2
-        b = max(0, min(b, len(ori) - 1))
-        b_indices.append(b)
-    b_indices = np.array(b_indices, dtype=np.int64)
-    if b_indices.size == 0:
+        a = idx + window_size // 2 - stride // 2
+        a = max(0, min(a, len(ori) - 1))
+        a_indices.append(a)
+    a_indices = np.array(a_indices, dtype=np.int64)
+    if a_indices.size == 0:
         return np.zeros((0, 3, 3), dtype=np.float32)
 
-    init_q = ori[b_indices[0]].astype(np.float32)
+    init_q = ori[a_indices[0]].astype(np.float32)
     iw, ix, iy, iz = init_q
     ww = iw * iw
     xx = ix * ix
@@ -55,7 +55,7 @@ def compute_init_rot(ori: np.ndarray, pos_xyz: np.ndarray, window_size: int, str
         [2 * (xy + wz), ww - xx + yy - zz, 2 * (yz - wx)],
         [2 * (xz - wy), 2 * (yz + wx), ww - xx - yy + zz],
     ], dtype=np.float32)
-    init_rot = np.repeat(Rq[None, :, :], len(b_indices), axis=0)
+    init_rot = np.repeat(Rq[None, :, :], len(a_indices), axis=0)
     return init_rot
 
 

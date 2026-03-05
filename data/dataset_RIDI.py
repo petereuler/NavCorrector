@@ -135,7 +135,8 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data,
                    window_size=160, stride=36, filter_window=20,
                    smooth_length=False, length_sigma=1.0,
                    return_ori=False, return_rel_ori=False,
-                   return_delta_p=False, return_delta_p_world=False):
+                   return_delta_p=False, return_delta_p_world=False,
+                   flatten_world_z_for_body_label=False):
     m = min(gyro_data.shape[0], acc_data.shape[0], pos_data.shape[0], ori_data.shape[0])
     gyro_data = gyro_data[:m]
     acc_data = acc_data[:m]
@@ -185,9 +186,14 @@ def window_dataset(gyro_data, acc_data, pos_data, ori_data,
         y_len.append(np.array([delta_len], dtype=np.float32))
         if return_delta_p:
             dp_world = (pos_end_xyz - pos_start_xyz).astype(np.float32)
+            if flatten_world_z_for_body_label:
+                dp_world_for_body = dp_world.copy()
+                dp_world_for_body[2] = 0.0
+            else:
+                dp_world_for_body = dp_world
             q_start = ori_data[start_idx].astype(np.float32)
             R_start = quat_to_rotmat(q_start)
-            dp_body = (R_start.T @ dp_world.reshape(3, 1)).reshape(3,)
+            dp_body = (R_start.T @ dp_world_for_body.reshape(3, 1)).reshape(3,)
             y_dp.append(dp_body.astype(np.float32))
         if return_delta_p_world:
             if not return_delta_p:

@@ -9,7 +9,11 @@ import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-from data.dataset_OXIOD import load_oxiod_raw, window_dataset as oxiod_window
+from data.dataset_OXIOD import (
+    get_oxiod_predefined_split_pairs,
+    load_oxiod_raw,
+    window_dataset as oxiod_window,
+)
 from data.dataset_SELFMADE import load_selfmade_raw, window_dataset as selfmade_window
 from data.dataset_RONIN import load_ronin_raw, window_dataset as ronin_window
 from data.dataset_RIDI import load_ridi_raw, window_dataset as ridi_window
@@ -35,61 +39,38 @@ def load_data_oxiod(data_root, device, window_size=160, stride=32):
     Returns:
         x_tr, ylen_tr, yhead_tr, x_va, ylen_va, yhead_va
     """
-    imu_files = [
-        os.path.join(data_root, 'handheld', 'data1', 'syn', 'imu1.csv'),
-        os.path.join(data_root, 'handheld', 'data1', 'syn', 'imu3.csv'),
-        os.path.join(data_root, 'handheld', 'data1', 'syn', 'imu4.csv'),
-        os.path.join(data_root, 'handheld', 'data1', 'syn', 'imu7.csv'),
-        os.path.join(data_root, 'handheld', 'data2', 'syn', 'imu1.csv'),
-        os.path.join(data_root, 'handheld', 'data2', 'syn', 'imu2.csv'),
-        os.path.join(data_root, 'handheld', 'data2', 'syn', 'imu3.csv'),
-        os.path.join(data_root, 'handheld', 'data3', 'syn', 'imu2.csv'),
-        os.path.join(data_root, 'handheld', 'data3', 'syn', 'imu3.csv'),
-        os.path.join(data_root, 'handheld', 'data3', 'syn', 'imu4.csv'),
-        os.path.join(data_root, 'handheld', 'data3', 'syn', 'imu5.csv'),
-        os.path.join(data_root, 'handheld', 'data4', 'syn', 'imu2.csv'),
-        os.path.join(data_root, 'handheld', 'data4', 'syn', 'imu4.csv'),
-        os.path.join(data_root, 'handheld', 'data4', 'syn', 'imu5.csv'),
-        os.path.join(data_root, 'handheld', 'data5', 'syn', 'imu1.csv'),
-        os.path.join(data_root, 'handheld', 'data5', 'syn', 'imu2.csv'),
-        os.path.join(data_root, 'handheld', 'data5', 'syn', 'imu4.csv'),
-    ]
-    gt_files = [f.replace("imu", "vi") for f in imu_files]
-
-    val_set = set([
-        os.path.join(data_root, 'handheld', 'data1', 'syn', 'imu4.csv'),
-        os.path.join(data_root, 'handheld', 'data2', 'syn', 'imu2.csv'),
-        os.path.join(data_root, 'handheld', 'data3', 'syn', 'imu4.csv'),
-        os.path.join(data_root, 'handheld', 'data4', 'syn', 'imu5.csv'),
-        os.path.join(data_root, 'handheld', 'data5', 'syn', 'imu1.csv'),
-    ])
-
     xg_tr, xa_tr, yl_tr, yh_tr = [], [], [], []
     xg_va, xa_va, yl_va, yh_va = [], [], [], []
-    
-    for imu, gt in zip(imu_files, gt_files):
+
+    train_pairs = get_oxiod_predefined_split_pairs(data_root, split="train", sensor="syn")
+    test_pairs = get_oxiod_predefined_split_pairs(data_root, split="test", sensor="syn")
+
+    for _, imu, gt in train_pairs:
         gyro, acc, pos_xyz, ori = load_oxiod_raw(imu, gt)
-        
-        [gx, ax], [dl, dh], _, _ = oxiod_window(
-            gyro, acc, pos_xyz, ori,
-            window_size=window_size,
-            stride=stride,
-            filter_window=20,
-            smooth_heading=True,  # 启用航向角平滑，提高真值轨迹光滑性
-            heading_sigma=1.5,    # 航向角高斯平滑标准差
-            smooth_length=False,   # 不平滑步长，只平滑航向
-            length_sigma=1.0,    # 步长高斯平滑标准差
+        [gx, ax], [dl], _, _ = oxiod_window(
+            gyro, acc, pos_xyz, ori, window_size=window_size, stride=stride, filter_window=20
         )
-        if imu in val_set:
-            xg_va.append(gx)
-            xa_va.append(ax)
-            yl_va.append(dl)
-            yh_va.append(dh)
-        else:
-            xg_tr.append(gx)
-            xa_tr.append(ax)
-            yl_tr.append(dl)
-            yh_tr.append(dh)
+        if gx.shape[0] == 0:
+            continue
+        xg_tr.append(gx)
+        xa_tr.append(ax)
+        yl_tr.append(dl)
+        yh_tr.append(np.zeros_like(dl))
+
+    for _, imu, gt in test_pairs:
+        gyro, acc, pos_xyz, ori = load_oxiod_raw(imu, gt)
+        [gx, ax], [dl], _, _ = oxiod_window(
+            gyro, acc, pos_xyz, ori, window_size=window_size, stride=stride, filter_window=20
+        )
+        if gx.shape[0] == 0:
+            continue
+        xg_va.append(gx)
+        xa_va.append(ax)
+        yl_va.append(dl)
+        yh_va.append(np.zeros_like(dl))
+
+    if len(xg_tr) == 0 or len(xg_va) == 0:
+        raise RuntimeError("OXIOD train/test split is empty, please check OXIOD data and list files.")
 
     x_tr = np.concatenate(xg_tr, axis=0)
     x_tr = np.concatenate([x_tr, np.concatenate(xa_tr, axis=0)], axis=-1)
@@ -104,6 +85,240 @@ def load_data_oxiod(data_root, device, window_size=160, stride=32):
     yhead_va = torch.tensor(np.concatenate(yh_va, axis=0), dtype=torch.float32, device=device)
 
     return x_tr, ylen_tr, yhead_tr, x_va, ylen_va, yhead_va
+
+
+def load_data_oxiod_absheading(
+    oxiod_root,
+    device,
+    window_size=160,
+    stride=32,
+    return_ori=False,
+    return_rel_ori=False,
+    return_seq=False,
+    return_init=False,
+    return_delta_p=False,
+    return_delta_p_world=False,
+    align_init_quat=False,
+    align_init_quat_to_labels=True,
+    return_align=False,
+    flatten_world_z_for_body_label=False,
+):
+    """
+    加载 OXIOD 数据集并按项目内预设划分训练/验证，接口对齐 RIDI absheading。
+    """
+    train_pairs = get_oxiod_predefined_split_pairs(oxiod_root, split="train", sensor="syn")
+    val_pairs = get_oxiod_predefined_split_pairs(oxiod_root, split="test", sensor="syn")
+    if len(train_pairs) == 0 or len(val_pairs) == 0:
+        raise RuntimeError("OXIOD predefined split is empty, please check data paths.")
+
+    xg_tr, xa_tr, yl_tr, yp_tr, ypw_tr, yo_tr, yr_tr, yi_tr, yalign_tr = [], [], [], [], [], [], [], [], []
+    xg_va, xa_va, yl_va, yp_va, ypw_va, yo_va, yr_va, yi_va, yalign_va = [], [], [], [], [], [], [], [], []
+    seq_tr = []
+    seq_va = []
+
+    def _quat_conj_batch(q):
+        q = np.asarray(q, dtype=np.float32).reshape(-1, 4)
+        return np.stack([q[:, 0], -q[:, 1], -q[:, 2], -q[:, 3]], axis=1)
+
+    def _quat_mul_batch(q1, q2):
+        q1 = np.asarray(q1, dtype=np.float32).reshape(-1, 4)
+        q2 = np.asarray(q2, dtype=np.float32).reshape(-1, 4)
+        if q1.shape[0] == 1 and q2.shape[0] > 1:
+            q1 = np.repeat(q1, q2.shape[0], axis=0)
+        if q2.shape[0] == 1 and q1.shape[0] > 1:
+            q2 = np.repeat(q2, q1.shape[0], axis=0)
+        w1, x1, y1, z1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
+        w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
+        w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+        x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+        y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+        z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+        return np.stack([w, x, y, z], axis=1)
+
+    def _quat_to_rotmat(q):
+        w, x, y, z = q
+        ww = w * w
+        xx = x * x
+        yy = y * y
+        zz = z * z
+        wx = w * x
+        wy = w * y
+        wz = w * z
+        xy = x * y
+        xz = x * z
+        yz = y * z
+        return np.array([
+            [ww + xx - yy - zz, 2 * (xy - wz), 2 * (xz + wy)],
+            [2 * (xy + wz), ww - xx + yy - zz, 2 * (yz - wx)],
+            [2 * (xz - wy), 2 * (yz + wx), ww - xx - yy + zz],
+        ], dtype=np.float32)
+
+    for seq_idx, (name, imu, gt) in enumerate(train_pairs + val_pairs):
+        gyro, acc, pos_xyz, ori = load_oxiod_raw(imu, gt)
+        q_align = None
+        R_align = None
+        if align_init_quat:
+            q0 = ori[0].astype(np.float32)
+            q_align = _quat_conj_batch(q0)[0]
+            R_align = _quat_to_rotmat(q_align)
+
+        max_start = gyro.shape[0] - window_size - 1
+        a_indices = []
+        for idx in range(0, max_start, stride):
+            a = idx + window_size // 2 - stride // 2
+            a = max(0, min(a, len(pos_xyz) - 1))
+            a_indices.append(a)
+        a_indices = np.array(a_indices, dtype=np.int64)
+        if a_indices.size == 0:
+            continue
+
+        [gx, ax], labels, _, _ = oxiod_window(
+            gyro, acc, pos_xyz, ori,
+            window_size=window_size,
+            stride=stride,
+            filter_window=0,
+            smooth_length=False,
+            length_sigma=1.0,
+            return_ori=return_ori,
+            return_rel_ori=return_rel_ori,
+            return_delta_p=return_delta_p,
+            return_delta_p_world=return_delta_p_world,
+            flatten_world_z_for_body_label=flatten_world_z_for_body_label,
+        )
+        if gx.shape[0] == 0:
+            continue
+
+        dl = labels[0]
+        label_idx = 1
+        dori = None
+        if return_ori:
+            dori = labels[label_idx]
+            label_idx += 1
+        drel = None
+        if return_rel_ori:
+            drel = labels[label_idx]
+            label_idx += 1
+        dp = None
+        if return_delta_p:
+            dp = labels[label_idx]
+            label_idx += 1
+        dp_world = None
+        if return_delta_p_world:
+            dp_world = labels[label_idx]
+            label_idx += 1
+
+        if align_init_quat_to_labels and align_init_quat and return_ori:
+            dori = _quat_mul_batch(q_align, dori)
+
+        init_q = ori[a_indices[0]].astype(np.float32)
+        init_rot = _quat_to_rotmat(init_q)
+        if align_init_quat_to_labels and align_init_quat and return_init:
+            init_rot = R_align @ init_rot
+
+        is_val = seq_idx >= len(train_pairs)
+        if is_val:
+            xg_va.append(gx)
+            xa_va.append(ax)
+            yl_va.append(dl)
+            if return_delta_p:
+                yp_va.append(dp)
+            if return_delta_p_world:
+                ypw_va.append(dp_world)
+            if return_ori:
+                yo_va.append(dori)
+            if return_rel_ori:
+                yr_va.append(drel)
+            if return_init:
+                yi_va.append(np.repeat(init_rot[None, :, :], gx.shape[0], axis=0))
+            if return_align and align_init_quat:
+                yalign_va.append(np.repeat(R_align[None, :, :], gx.shape[0], axis=0))
+            if return_seq:
+                seq_va.append(np.full((gx.shape[0],), len(seq_va), dtype=np.int64))
+        else:
+            xg_tr.append(gx)
+            xa_tr.append(ax)
+            yl_tr.append(dl)
+            if return_delta_p:
+                yp_tr.append(dp)
+            if return_delta_p_world:
+                ypw_tr.append(dp_world)
+            if return_ori:
+                yo_tr.append(dori)
+            if return_rel_ori:
+                yr_tr.append(drel)
+            if return_init:
+                yi_tr.append(np.repeat(init_rot[None, :, :], gx.shape[0], axis=0))
+            if return_align and align_init_quat:
+                yalign_tr.append(np.repeat(R_align[None, :, :], gx.shape[0], axis=0))
+            if return_seq:
+                seq_tr.append(np.full((gx.shape[0],), len(seq_tr), dtype=np.int64))
+
+    if len(xg_tr) == 0 or len(xg_va) == 0:
+        raise RuntimeError("OXIOD processed train/val data is empty after windowing.")
+
+    x_tr = np.concatenate(xg_tr, axis=0)
+    x_tr = np.concatenate([x_tr, np.concatenate(xa_tr, axis=0)], axis=-1)
+    x_tr = torch.tensor(x_tr, dtype=torch.float32, device=device)
+    ylen_tr = torch.tensor(np.concatenate(yl_tr, axis=0), dtype=torch.float32, device=device)
+    ydp_tr = torch.tensor(np.concatenate(yp_tr, axis=0), dtype=torch.float32, device=device) if return_delta_p else None
+    ydpw_tr = torch.tensor(np.concatenate(ypw_tr, axis=0), dtype=torch.float32, device=device) if return_delta_p_world else None
+    yori_tr = torch.tensor(np.concatenate(yo_tr, axis=0), dtype=torch.float32, device=device) if return_ori else None
+    yrel_tr = torch.tensor(np.concatenate(yr_tr, axis=0), dtype=torch.float32, device=device) if return_rel_ori else None
+    seqid_tr = torch.tensor(np.concatenate(seq_tr, axis=0), dtype=torch.int64, device=device) if return_seq else None
+    yinit_tr = torch.tensor(np.concatenate(yi_tr, axis=0), dtype=torch.float32, device=device) if return_init else None
+    yalign_tr_t = (
+        torch.tensor(np.concatenate(yalign_tr, axis=0), dtype=torch.float32, device=device)
+        if (return_align and align_init_quat)
+        else None
+    )
+
+    x_va = np.concatenate(xg_va, axis=0)
+    x_va = np.concatenate([x_va, np.concatenate(xa_va, axis=0)], axis=-1)
+    x_va = torch.tensor(x_va, dtype=torch.float32, device=device)
+    ylen_va = torch.tensor(np.concatenate(yl_va, axis=0), dtype=torch.float32, device=device)
+    ydp_va = torch.tensor(np.concatenate(yp_va, axis=0), dtype=torch.float32, device=device) if return_delta_p else None
+    ydpw_va = torch.tensor(np.concatenate(ypw_va, axis=0), dtype=torch.float32, device=device) if return_delta_p_world else None
+    yori_va = torch.tensor(np.concatenate(yo_va, axis=0), dtype=torch.float32, device=device) if return_ori else None
+    yrel_va = torch.tensor(np.concatenate(yr_va, axis=0), dtype=torch.float32, device=device) if return_rel_ori else None
+    seqid_va = torch.tensor(np.concatenate(seq_va, axis=0), dtype=torch.int64, device=device) if return_seq else None
+    yinit_va = torch.tensor(np.concatenate(yi_va, axis=0), dtype=torch.float32, device=device) if return_init else None
+    yalign_va_t = (
+        torch.tensor(np.concatenate(yalign_va, axis=0), dtype=torch.float32, device=device)
+        if (return_align and align_init_quat)
+        else None
+    )
+
+    outputs = [x_tr, ylen_tr]
+    if return_delta_p:
+        outputs.append(ydp_tr)
+    if return_delta_p_world:
+        outputs.append(ydpw_tr)
+    if return_ori:
+        outputs.append(yori_tr)
+    if return_rel_ori:
+        outputs.append(yrel_tr)
+    if return_seq:
+        outputs.append(seqid_tr)
+    if return_init:
+        outputs.append(yinit_tr)
+    if return_align and align_init_quat:
+        outputs.append(yalign_tr_t)
+    outputs += [x_va, ylen_va]
+    if return_delta_p:
+        outputs.append(ydp_va)
+    if return_delta_p_world:
+        outputs.append(ydpw_va)
+    if return_ori:
+        outputs.append(yori_va)
+    if return_rel_ori:
+        outputs.append(yrel_va)
+    if return_seq:
+        outputs.append(seqid_va)
+    if return_init:
+        outputs.append(yinit_va)
+    if return_align and align_init_quat:
+        outputs.append(yalign_va_t)
+    return tuple(outputs)
 
 
 def load_data_selfmade(selfmade_root, device, window_size=160, stride=32):
@@ -326,7 +541,7 @@ def load_data_ridi(ridi_root, device, window_size=160, stride=32):
     return x_tr, ylen_tr, x_va, ylen_va
 
 
-def load_data_ridi_absheading(ridi_root, device, window_size=160, stride=32, return_ori=False, return_rel_ori=False, return_seq=False, return_init=False, return_delta_p=False, return_delta_p_world=False, align_init_quat=False, acc_source="acce", align_init_quat_to_labels=True, return_align=False):
+def load_data_ridi_absheading(ridi_root, device, window_size=160, stride=32, return_ori=False, return_rel_ori=False, return_seq=False, return_init=False, return_delta_p=False, return_delta_p_world=False, align_init_quat=False, acc_source="acce", align_init_quat_to_labels=True, return_align=False, flatten_world_z_for_body_label=False):
     """
     加载 RIDI 数据集并分割为训练/验证，返回 3D 标签（不包含 heading）
     """
@@ -404,12 +619,12 @@ def load_data_ridi_absheading(ridi_root, device, window_size=160, stride=32, ret
             R_align = _quat_to_rotmat(q_align)
 
         max_start = gyro.shape[0] - window_size - 1
-        b_indices = []
+        a_indices = []
         for idx in range(0, max_start, stride):
-            b = idx + window_size // 2 + stride // 2
-            b = max(0, min(b, len(pos_xyz) - 1))
-            b_indices.append(b)
-        b_indices = np.array(b_indices, dtype=np.int64)
+            a = idx + window_size // 2 - stride // 2
+            a = max(0, min(a, len(pos_xyz) - 1))
+            a_indices.append(a)
+        a_indices = np.array(a_indices, dtype=np.int64)
 
         [gx, ax], labels, _, _ = ridi_window(
             gyro, acc, pos_xyz, ori,
@@ -422,6 +637,7 @@ def load_data_ridi_absheading(ridi_root, device, window_size=160, stride=32, ret
             return_rel_ori=return_rel_ori,
             return_delta_p=return_delta_p,
             return_delta_p_world=return_delta_p_world,
+            flatten_world_z_for_body_label=flatten_world_z_for_body_label,
         )
 
         dl = labels[0]
@@ -446,7 +662,7 @@ def load_data_ridi_absheading(ridi_root, device, window_size=160, stride=32, ret
         if align_init_quat_to_labels and align_init_quat and return_ori:
             dori = _quat_mul_batch(q_align, dori)
 
-        init_q = ori[b_indices[0]].astype(np.float32)
+        init_q = ori[a_indices[0]].astype(np.float32)
         iw, ix, iy, iz = init_q
         ww = iw * iw
         xx = ix * ix
